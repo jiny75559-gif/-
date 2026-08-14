@@ -1,0 +1,13 @@
+{
+  "display_name": "晋阳的同人库",
+  "loading_order": 90,
+  "requires": [],
+  "optional": [],
+  "generate_interceptor": "fandomCanonPreflight",
+  "js": "index.js?v=2.0.2",
+  "css": "style.css?v=2.0.2",
+  "author": "Codex",
+  "version": "2.0.2",
+  "auto_update": true,
+  "minimum_client_version": "1.12.0"
+}
