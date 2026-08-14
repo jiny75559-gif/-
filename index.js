@@ -20,6 +20,7 @@ const QUICK_BUTTON_ID = 'fandom-canon-quick-button';
 const MENU_ENTRY_ID = 'fandom-canon-menu-entry';
 const LOCAL_CREDENTIAL_PREFIX = 'sillytavern-fandom-canon-retriever';
 const WORLD_ENTRY_PREFIX = '【同人原作资料库·插件自动维护】';
+const EXTENSION_VERSION = '2.1.4';
 const DEFAULTS = {
     enabled: true,
     language: 'zh',
@@ -1529,14 +1530,14 @@ function panelHtml() {
     return `<div id="${PANEL_ID}" class="fandom-canon-panel">
         <div class="inline-drawer">
             <div class="inline-drawer-toggle inline-drawer-header">
-                <b><i class="fa-solid fa-book-atlas"></i> 晋阳的同人库</b>
+                <b><i class="fa-solid fa-book-atlas"></i> 晋阳的同人库 <small class="fcr-version">v${EXTENSION_VERSION}</small></b>
                 <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
             </div>
             <div class="inline-drawer-content">
-                <label class="checkbox_label"><input id="fcr-enabled" type="checkbox" ${config.enabled ? 'checked' : ''}><span>生成前自动核实原作资料</span></label>
-                <label class="checkbox_label"><input id="fcr-planner" type="checkbox" ${config.autoPlanner ? 'checked' : ''}><span>让分析模型规划本轮检索词（会多一次短请求）</span></label>
-                <label class="checkbox_label"><input id="fcr-auto-update-profile" type="checkbox" ${config.autoUpdateProfile ? 'checked' : ''}><span>随剧情自动更新作品、时间线和当前人物表</span></label>
-                <label class="checkbox_label"><input id="fcr-strict" type="checkbox" ${config.strictMode ? 'checked' : ''}><span>严格模式：没有资料依据时不编造精确设定</span></label>
+                <button id="fcr-enabled" class="fcr-check-row" type="button" aria-pressed="${config.enabled}"><span class="fcr-check-box" aria-hidden="true"></span><span>生成前自动核实原作资料</span></button>
+                <button id="fcr-planner" class="fcr-check-row" type="button" aria-pressed="${config.autoPlanner}"><span class="fcr-check-box" aria-hidden="true"></span><span>让分析模型规划本轮检索词（会多一次短请求）</span></button>
+                <button id="fcr-auto-update-profile" class="fcr-check-row" type="button" aria-pressed="${config.autoUpdateProfile}"><span class="fcr-check-box" aria-hidden="true"></span><span>随剧情自动更新作品、时间线和当前人物表</span></button>
+                <button id="fcr-strict" class="fcr-check-row" type="button" aria-pressed="${config.strictMode}"><span class="fcr-check-box" aria-hidden="true"></span><span>严格模式：没有资料依据时不编造精确设定</span></button>
                 <div class="fcr-grid">
                     <label>Wikipedia 语言<select id="fcr-language"><option value="zh">中文</option><option value="ja">日文</option><option value="en">英文</option></select></label>
                     <label>每次最多查询数<input id="fcr-max-queries" type="number" min="1" max="5" value="${config.maxQueries}"></label>
@@ -1726,44 +1727,21 @@ function bindPanel() {
             saveSettingsDebounced();
         });
     };
-    bindSetting('#fcr-enabled', 'enabled', Boolean);
-    bindSetting('#fcr-planner', 'autoPlanner', Boolean);
-    bindSetting('#fcr-auto-update-profile', 'autoUpdateProfile', Boolean);
-    bindSetting('#fcr-strict', 'strictMode', Boolean);
-
-    // Some Android WebViews render SillyTavern's custom checkbox correctly but
-    // fail to synthesize the label click after a touch. Handle a stationary
-    // touch explicitly and suppress only its duplicate synthetic click.
-    document.querySelectorAll(`#${PANEL_ID} .checkbox_label`).forEach(label => {
-        const input = label.querySelector('input[type="checkbox"]');
-        if (!(input instanceof HTMLInputElement)) return;
-        let touchStart = null;
-        let handledAt = 0;
-        label.addEventListener('touchstart', event => {
-            const touch = event.changedTouches?.[0];
-            touchStart = touch ? { id: touch.identifier, x: touch.clientX, y: touch.clientY } : null;
-        }, { passive: true });
-        label.addEventListener('touchend', event => {
-            if (!touchStart) return;
-            const touch = [...(event.changedTouches ?? [])].find(item => item.identifier === touchStart.id);
-            const moved = !touch || Math.hypot(touch.clientX - touchStart.x, touch.clientY - touchStart.y) > 12;
-            touchStart = null;
-            if (moved || input.disabled) return;
-            event.preventDefault();
-            event.stopPropagation();
-            input.checked = !input.checked;
-            handledAt = Date.now();
-            input.dispatchEvent(new Event('change', { bubbles: true }));
-        }, { passive: false });
-        label.addEventListener('touchcancel', () => {
-            touchStart = null;
-        }, { passive: true });
-        label.addEventListener('click', event => {
-            if (Date.now() - handledAt >= 700) return;
-            event.preventDefault();
-            event.stopPropagation();
-        }, true);
-    });
+    const bindToggle = (selector, key) => {
+        const button = document.querySelector(selector);
+        if (!(button instanceof HTMLButtonElement)) return;
+        const render = () => button.setAttribute('aria-pressed', String(Boolean(settings()[key])));
+        button.addEventListener('click', () => {
+            settings()[key] = !Boolean(settings()[key]);
+            render();
+            saveSettingsDebounced();
+        });
+        render();
+    };
+    bindToggle('#fcr-enabled', 'enabled');
+    bindToggle('#fcr-planner', 'autoPlanner');
+    bindToggle('#fcr-auto-update-profile', 'autoUpdateProfile');
+    bindToggle('#fcr-strict', 'strictMode');
 
     bindSetting('#fcr-language', 'language', String);
     bindSetting('#fcr-max-queries', 'maxQueries', value => clampInt(value, 1, 5, 3));
