@@ -140,3 +140,193 @@
         grid-template-columns: 1fr;
     }
 }
+
+/* Touch devices and narrow windows: fit the popup to the actual visual viewport.
+ * Desktop mouse layouts keep the rules above unchanged. */
+@media (max-width: 700px), (pointer: coarse) and (max-width: 1024px) {
+    .popup:has(#fandom-canon-settings) {
+        box-sizing: border-box;
+        width: calc(100dvw - 12px) !important;
+        max-width: calc(100dvw - 12px) !important;
+        height: calc(100dvh - max(12px, env(safe-area-inset-top)) - max(12px, env(safe-area-inset-bottom))) !important;
+        max-height: calc(100dvh - max(12px, env(safe-area-inset-top)) - max(12px, env(safe-area-inset-bottom))) !important;
+        min-width: 0 !important;
+        min-height: 0 !important;
+        padding: 4px;
+        border-radius: clamp(8px, 2.5vw, 14px);
+        overscroll-behavior: contain;
+    }
+
+    .popup:has(#fandom-canon-settings) .popup-body,
+    .popup:has(#fandom-canon-settings) .popup-content {
+        box-sizing: border-box;
+        width: 100%;
+        min-width: 0;
+        min-height: 0;
+    }
+
+    .popup:has(#fandom-canon-settings) .popup-content {
+        margin-top: 2px;
+        padding: 0 clamp(3px, 1.6vw, 10px);
+        overflow-x: hidden;
+        overflow-y: auto;
+        scrollbar-gutter: stable;
+        -webkit-overflow-scrolling: touch;
+    }
+
+    .fandom-canon-panel.fcr-popup-mode {
+        box-sizing: border-box;
+        width: 100%;
+        max-width: 100%;
+        min-width: 0;
+        font-size: clamp(13px, 3.7vw, 16px);
+        line-height: 1.38;
+        overflow-wrap: anywhere;
+    }
+
+    .fandom-canon-panel .inline-drawer-content {
+        padding: 4px clamp(2px, 1.4vw, 8px) 10px;
+    }
+
+    .fandom-canon-panel .inline-drawer-header {
+        position: sticky;
+        top: 0;
+        z-index: 2;
+        min-height: 42px;
+        padding: 7px 5px;
+        background: var(--SmartThemeBlurTintColor);
+    }
+
+    .fandom-canon-panel .checkbox_label {
+        align-items: flex-start;
+        gap: 7px;
+        margin: 5px 0;
+        line-height: 1.35;
+    }
+
+    .fandom-canon-panel .checkbox_label input {
+        flex: 0 0 auto;
+        margin-top: 0.15em;
+    }
+
+    .fandom-canon-panel .checkbox_label span {
+        min-width: 0;
+    }
+
+    .fandom-canon-panel label:not(.checkbox_label) {
+        gap: 3px;
+        margin: 6px 0;
+    }
+
+    .fandom-canon-panel input,
+    .fandom-canon-panel select,
+    .fandom-canon-panel textarea {
+        box-sizing: border-box;
+        width: 100%;
+        max-width: 100%;
+        min-width: 0;
+        min-height: 42px;
+        padding: 7px 9px;
+        font-size: clamp(14px, 3.8vw, 16px) !important;
+        line-height: 1.25;
+    }
+
+    .fandom-canon-panel textarea {
+        min-height: 74px;
+        resize: vertical;
+    }
+
+    .fcr-api-box {
+        margin: 8px 0;
+        padding: 8px;
+        border-radius: 8px;
+    }
+
+    .fcr-api-box > summary {
+        min-height: 36px;
+        padding: 5px 1px;
+        line-height: 1.35;
+    }
+
+    .fcr-api-actions,
+    .fcr-actions {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 7px;
+    }
+
+    .fcr-actions .menu_button,
+    .fcr-api-actions .menu_button {
+        box-sizing: border-box;
+        width: 100% !important;
+        min-width: 0;
+        min-height: 42px;
+        height: auto;
+        padding: 7px 8px;
+        color: var(--SmartThemeBodyColor) !important;
+        font-size: clamp(13px, 3.5vw, 15px) !important;
+        line-height: 1.25;
+        white-space: normal;
+        overflow-wrap: anywhere;
+    }
+
+    .fcr-key-state,
+    .fcr-help,
+    .fcr-report {
+        font-size: clamp(12px, 3.35vw, 14px);
+        line-height: 1.45;
+    }
+
+    .fcr-key-state {
+        grid-column: 1 / -1;
+    }
+
+    .popup:has(#fandom-canon-settings) .popup-controls {
+        box-sizing: border-box;
+        width: 100%;
+        flex: 0 0 auto;
+        justify-content: center;
+        margin-top: 4px;
+        padding: 5px max(8px, env(safe-area-inset-right)) max(6px, env(safe-area-inset-bottom)) max(8px, env(safe-area-inset-left));
+    }
+
+    .popup:has(#fandom-canon-settings) .popup-controls .menu_button {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        width: auto !important;
+        min-width: 104px;
+        min-height: 42px;
+        padding: 7px 18px;
+        color: #fff !important;
+        text-shadow: 0 1px 2px rgba(0, 0, 0, 0.65);
+        font-size: clamp(14px, 3.8vw, 16px) !important;
+        line-height: 1.2;
+        white-space: nowrap;
+    }
+}
+
+/* Phone portrait: one readable column. */
+@media (max-width: 700px) {
+    .fandom-canon-panel .fcr-grid,
+    .fandom-canon-panel .fcr-api-actions,
+    .fandom-canon-panel .fcr-actions {
+        grid-template-columns: minmax(0, 1fr);
+    }
+
+    .fandom-canon-panel .fcr-llm-grid label:first-child,
+    .fandom-canon-panel .fcr-key-state {
+        grid-column: 1;
+    }
+}
+
+/* Touch landscape/tablet: use available width without restoring the desktop density. */
+@media (pointer: coarse) and (min-width: 701px) and (max-width: 1024px) {
+    .fandom-canon-panel .fcr-grid {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+
+    .fandom-canon-panel .fcr-llm-grid label:first-child {
+        grid-column: span 2;
+    }
+}
