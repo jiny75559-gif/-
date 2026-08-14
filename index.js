@@ -20,7 +20,7 @@ const QUICK_BUTTON_ID = 'fandom-canon-quick-button';
 const MENU_ENTRY_ID = 'fandom-canon-menu-entry';
 const LOCAL_CREDENTIAL_PREFIX = 'sillytavern-fandom-canon-retriever';
 const WORLD_ENTRY_PREFIX = '【同人原作资料库·插件自动维护】';
-const EXTENSION_VERSION = '2.1.5';
+const EXTENSION_VERSION = '2.1.6';
 const DEFAULTS = {
     enabled: true,
     language: 'zh',
@@ -617,6 +617,43 @@ function cleanDetectedEntities(values) {
         .slice(0, 40);
 }
 
+function cleanEntityCandidates(values) {
+    const candidates = [];
+    for (const value of Array.isArray(values) ? values : []) {
+        const raw = typeof value === 'string' ? { candidateName: value } : (value || {});
+        const candidateName = normalizeEntityDisplay(raw.candidateName ?? raw.name ?? raw.entity ?? '');
+        if (!cleanDetectedEntities([candidateName]).length) continue;
+        const key = canonicalEntityKey(candidateName);
+        if (candidates.some(item => canonicalEntityKey(item.candidateName) === key)) continue;
+        candidates.push({
+            candidateName,
+            isOriginal: raw.isOriginal === true,
+            workHint: String(raw.workHint ?? raw.work ?? '').trim(),
+            contextEvidence: String(raw.contextEvidence ?? raw.evidence ?? '').trim(),
+        });
+    }
+    return candidates.slice(0, 40);
+}
+
+function recordAliases(record, fallbackName = '') {
+    return cleanDetectedEntities([
+        fallbackName,
+        record?.entity,
+        ...(Array.isArray(record?.aliases) ? record.aliases : []),
+    ]);
+}
+
+function findCanonRecordName(candidate, database = storedCanonEntities()) {
+    const key = canonicalEntityKey(candidate);
+    if (!key) return '';
+    return Object.entries(database).find(([name, record]) =>
+        recordAliases(record, name).some(alias => canonicalEntityKey(alias) === key))?.[0] || '';
+}
+
+function resolveCanonEntityName(candidate, database = storedCanonEntities()) {
+    return findCanonRecordName(candidate, database) || normalizeEntityDisplay(candidate);
+}
+
 function cleanPlannedQueries(values, work = '') {
     return [...new Set((Array.isArray(values) ? values : [])
         .map(String)
@@ -641,7 +678,7 @@ async function planQueries(chat) {
     const fixedEntities = visibleEntities.filter(entity => !previousAutoEntities.includes(entity));
     const fallbackEntities = [...new Set(visibleEntities.filter(Boolean))];
     const database = storedCanonEntities();
-    const missingFallbackEntities = fallbackEntities.filter(entity => !database[entity]?.sources?.length);
+    const missingFallbackEntities = fallbackEntities.filter(entity => !findCanonRecordName(entity, database));
     const fallbackQueries = missingFallbackEntities.map(name =>
         `${name} ${work} 原作完整角色档案：身份、年龄、外貌身材、典型穿着、性格行为逻辑、能力、重要经历、人际关系、说话风格`.trim());
 
@@ -649,21 +686,23 @@ async function planQueries(chat) {
         return {
             work,
             timeline: cardProfile.timeline.trim(),
-            entities: fallbackEntities,
+            entities: cleanDetectedEntities(fallbackEntities.map(entity => resolveCanonEntityName(entity, database))),
             timelineChanged: false,
             queries: fallbackQueries,
         };
     }
 
     const source = await researchContext(chat);
-    const plannerPrompt = `你是同人写作前的资料检索规划器。必须先阅读角色卡正文、世界书和最近剧情，再找出本轮续写真正需要外部核实的原作人物、地点、组织、事件或时间线节点。角色卡标题只是文件名，绝不能仅凭标题生成实体或搜索词。\n\n作品（当前表值）：${work || '未填写，请从正文判断'}\n当前时间线/AU节点（上轮表值）：${cardProfile.timeline || '未填写'}\n用户手动固定实体：${fixedEntities.join('、') || '无'}\n\n角色卡正文：\n${source.card || '未读取到'}\n\n本轮实际激活世界书：\n${source.worldInfo || '无'}\n\n最近剧情：\n${source.recent || '无'}\n\n只输出 JSON，不写解释：{"work":"有明确证据的原作名，否则沿用当前作品","storyType":"canon_timeline|au_timeline|original_world_with_fandom_characters|original_only|unknown","timeline":"当前剧情线","timelineChanged":false,"entities":["本轮新登场、重新登场或明确即将登场的具体原作人物/地点/组织"],"canonChanges":["正文明确说明的角色或剧情相对原著变化"],"queries":["仅用于已有档案的明确新增差异或重大时间线变化"]}\n规则：新角色首先需要完整基础档案，不能把饮食、喝酒、车辆等当前场景琐事当成主档案；插件会自动生成基础档案查询，你不要为新角色规划零碎问题。queries 最多 ${config.maxQueries} 条；不得使用“兄妹”“冒险”“OC”等泛称或角色卡标题；用户原创人物不应单独外搜；仅含同人角色但剧情属于用户原创世界时，不得硬套原作时间节点。只有篇章、原作事件阶段、AU关键状态或重大剧情线确实变化时，timelineChanged 才能为 true；普通对话、日常推进、换地点或时间流逝不得改写上轮时间线。已有角色默认沿用原著与缓存，只有正文明确给出相对原著的差异时才写入 canonChanges。`;
+    const plannerPrompt = `你是同人写作前的资料检索规划器。必须先阅读角色卡正文、世界书和最近剧情，再找出本轮续写真正需要外部核实的原作人物、地点、组织、事件或时间线节点。角色卡标题只是文件名，绝不能仅凭标题生成实体或搜索词。候选中文译名可能是正文模型写错的，只把它当检索线索，不得认定为正式名。\n\n作品（当前表值）：${work || '未填写，请从正文判断'}\n当前时间线/AU节点（上轮表值）：${cardProfile.timeline || '未填写'}\n用户手动固定实体：${fixedEntities.join('、') || '无'}\n\n角色卡正文：\n${source.card || '未读取到'}\n\n本轮实际激活世界书：\n${source.worldInfo || '无'}\n\n最近剧情：\n${source.recent || '无'}\n\n只输出 JSON，不写解释：{"work":"有明确证据的原作名，否则沿用当前作品","storyType":"canon_timeline|au_timeline|original_world_with_fandom_characters|original_only|unknown","timeline":"当前剧情线","timelineChanged":false,"entities":[{"candidateName":"上下文里的候选名","isOriginal":false,"workHint":"该人物实际所属作品；不确定留空","contextEvidence":"为何判断此人即将或刚刚登场的简短证据"}],"canonChanges":["正文明确说明的角色或剧情相对原著变化"],"queries":["仅用于已有档案的明确新增差异或重大时间线变化"]}\n规则：逐个判断人物是否为用户原创角色；原创人物 isOriginal=true，不外搜。新原作角色首先需要完整基础档案，不能把饮食、喝酒、车辆等当前场景琐事当成主档案。queries 最多 ${config.maxQueries} 条；不得使用“兄妹”“冒险”“OC”等泛称或角色卡标题；仅含同人角色但剧情属于用户原创世界时，不得硬套原作时间节点。每个候选人的 workHint 必须依据角色卡、已激活世界书和上下文单独判断，禁止把多作品卡的总标题强套给所有人。只有篇章、原作事件阶段、AU关键状态或重大剧情线确实变化时，timelineChanged 才能为 true；普通对话、日常推进、换地点或时间流逝不得改写上轮时间线。已有角色默认沿用原著与缓存，只有正文明确给出相对原著的差异时才写入 canonChanges。`;
 
     try {
         const parsed = await runJsonAnalysisPrompt(plannerPrompt, 1800);
         const manualWork = work && work !== cardProfile.lastAutoWorkTitle ? work : '';
         const plannedWork = manualWork || String(parsed.work ?? '').trim() || work;
-        const detectedEntities = cleanDetectedEntities(parsed.entities);
-        const missingVisibleEntities = visibleEntities.filter(entity => !database[entity]?.sources?.length);
+        const detectedCandidates = cleanEntityCandidates(parsed.entities);
+        const detectedCanonCandidates = detectedCandidates.filter(item => !item.isOriginal);
+        const detectedEntities = cleanDetectedEntities(detectedCanonCandidates.map(item => item.candidateName));
+        const missingVisibleEntities = visibleEntities.filter(entity => !findCanonRecordName(entity, database));
         const entities = [...new Set([...fixedEntities, ...missingVisibleEntities, ...detectedEntities])].slice(0, 8);
         let deltaQueries = Array.isArray(parsed.queries) ? parsed.queries.map(String) : [];
         deltaQueries = deltaQueries.map(x => x.trim()).filter(Boolean).map(x => {
@@ -671,9 +710,12 @@ async function planQueries(chat) {
             return `${x} ${plannedWork}`;
         });
         deltaQueries = cleanPlannedQueries(deltaQueries, plannedWork);
-        const newEntities = entities.filter(entity => !database[entity]?.sources?.length);
-        const baselineQueries = newEntities.map(entity =>
-            `${entity} ${plannedWork} 原作完整角色档案：身份、年龄、外貌身材、典型穿着、性格行为逻辑、能力、重要经历、人际关系、说话风格`.trim());
+        const newEntities = entities.filter(entity => !findCanonRecordName(entity, database));
+        const baselineQueries = newEntities.map(entity => {
+            const candidate = detectedCanonCandidates.find(item => canonicalEntityKey(item.candidateName) === canonicalEntityKey(entity));
+            const workHint = candidate?.workHint || (shouldAttachWorkTitle(plannedWork) ? plannedWork : '');
+            return `${entity} ${workHint} 核对正式姓名及原作完整角色档案：身份、年龄、外貌身材、典型穿着、性格行为逻辑、能力、重要经历、人际关系、说话风格`.trim();
+        });
         const queries = baselineQueries.length
             ? baselineQueries
             : (parsed.timelineChanged === true || (Array.isArray(parsed.canonChanges) && parsed.canonChanges.length) ? deltaQueries : []);
@@ -688,8 +730,9 @@ async function planQueries(chat) {
             timeline: manualTimeline || (parsed.storyType === 'original_world_with_fandom_characters' || parsed.storyType === 'original_only'
                 ? '用户原创世界（仅含同人角色，非原作剧情）'
                 : inferredTimeline) || cardProfile.timeline.trim(),
-            entities,
-            autoEntities: detectedEntities,
+            entities: cleanDetectedEntities(entities.map(entity => resolveCanonEntityName(entity, database))),
+            entityCandidates: detectedCanonCandidates,
+            autoEntities: cleanDetectedEntities(detectedEntities.map(entity => resolveCanonEntityName(entity, database))),
             canonChanges: Array.isArray(parsed.canonChanges) ? parsed.canonChanges.map(String).filter(Boolean) : [],
             timelineChanged: parsed.timelineChanged === true,
             queries: [...new Set(queries)].slice(0, config.maxQueries),
@@ -699,7 +742,7 @@ async function planQueries(chat) {
         return {
             work,
             timeline: cardProfile.timeline.trim(),
-            entities: fallbackEntities,
+            entities: cleanDetectedEntities(fallbackEntities.map(entity => resolveCanonEntityName(entity, database))),
             timelineChanged: false,
             queries: fallbackQueries.slice(0, config.maxQueries),
         };
@@ -712,7 +755,9 @@ function syncProfileFromPlan(plan) {
     const currentEntities = manualEntities(cardProfile.entities);
     const previousAutoEntities = cleanDetectedEntities(cardProfile.lastAutoEntities);
     const manualFixed = currentEntities.filter(entity => !previousAutoEntities.includes(entity));
-    const newlyDetectedEntities = cleanDetectedEntities(plan.autoEntities ?? plan.entities);
+    const database = storedCanonEntities();
+    const newlyDetectedEntities = cleanDetectedEntities(plan.autoEntities ?? plan.entities)
+        .map(entity => resolveCanonEntityName(entity, database));
     const nextAutoEntities = [...new Set([...previousAutoEntities, ...newlyDetectedEntities])].slice(0, 40);
     const nextEntities = [...new Set([...manualFixed, ...nextAutoEntities])].slice(0, 40);
 
@@ -933,9 +978,15 @@ function parseWebResults(provider, data, query) {
         const isBatchProfileRequest = /研究对象[：:]|"records"|完整角色档案/.test(query);
         if (isBatchProfileRequest && !records.length) return [];
         items = records.length ? records.map(record => ({
-            title: String(record?.entity || '').trim(),
+            title: String(record?.canonicalName || record?.entity || '').trim(),
             url: data?.sources?.[0]?.url || '',
             extract: String(record?.summary || '').trim(),
+            candidateName: String(record?.candidateName || record?.candidate || '').trim(),
+            canonicalName: String(record?.canonicalName || record?.entity || '').trim(),
+            originalName: String(record?.originalName || '').trim(),
+            workTitle: String(record?.workTitle || '').trim(),
+            aliases: Array.isArray(record?.aliases) ? record.aliases.map(String) : [],
+            verified: record?.verified !== false,
         })) : [{
             title: `搜索 AI 综合结果（${data?.rawModel || settings().searchAiModel}）`,
             url: data?.sources?.[0]?.url || '',
@@ -1094,6 +1145,7 @@ function consolidateCanonAliases(database, cardProfile) {
         const merged = {
             ...preferredRecord,
             entity: preferredName,
+            aliases: cleanDetectedEntities(names.flatMap((name, index) => recordAliases(records[index], name))),
             work: preferredRecord.work || records.find(record => record?.work)?.work || '',
             timeline: preferredRecord.timeline || records.find(record => record?.timeline)?.timeline || '',
             updatedAt: Math.max(0, ...records.map(record => Number(record?.updatedAt) || 0)),
@@ -1133,7 +1185,6 @@ function sanitizeCanonDatabase(database, cardProfile = profile()) {
             .filter(source => {
                 const text = String(source?.extract || '');
                 if (rejectedProfile.test(text)) return false;
-                if (source?.source === '自定义搜索 AI' && String(source?.title || '').trim() !== entity) return false;
                 return true;
             })
             .map(source => ({
@@ -1262,7 +1313,7 @@ async function syncCanonDatabaseToWorldBook(entities) {
             if (!entry) continue;
         }
         Object.assign(entry, {
-            key: [entity],
+            key: recordAliases(record, entity),
             keysecondary: [],
             comment,
             content: formatCanonWorldEntry(record),
@@ -1317,14 +1368,37 @@ async function saveCanonResearch(plan, pages) {
     const database = storedCanonEntities();
     const planEntities = cleanDetectedEntities(plan.entities);
     sanitizeCanonDatabase(database);
+    const replacements = new Map();
     for (const entity of planEntities) {
-        const previous = database[entity];
-        const relevant = pages.filter(page => page.source !== '自定义搜索 AI'
-            || String(page.title || '').trim() === entity).map(page => ({
+        const matchesEntity = page => {
+            const names = cleanDetectedEntities([
+                page?.candidateName,
+                page?.canonicalName,
+                page?.originalName,
+                page?.title,
+                ...(Array.isArray(page?.aliases) ? page.aliases : []),
+            ]);
+            return names.some(name => canonicalEntityKey(name) === canonicalEntityKey(entity));
+        };
+        const canonicalPage = pages.find(page => page.source === '自定义搜索 AI' && page.verified !== false && matchesEntity(page));
+        const canonicalName = cleanDetectedEntities([canonicalPage?.canonicalName || canonicalPage?.title])[0] || resolveCanonEntityName(entity, database);
+        const previousName = findCanonRecordName(entity, database) || findCanonRecordName(canonicalName, database);
+        const previous = database[previousName] || database[canonicalName];
+        const aliases = cleanDetectedEntities([
+            entity,
+            canonicalName,
+            previousName,
+            ...(Array.isArray(previous?.aliases) ? previous.aliases : []),
+            canonicalPage?.candidateName,
+            canonicalPage?.originalName,
+            ...(Array.isArray(canonicalPage?.aliases) ? canonicalPage.aliases : []),
+        ]);
+        const relevant = pages.filter(page => page.source !== '自定义搜索 AI' || matchesEntity(page)).map(page => ({
             ...page,
-            extract: extractEntitySpecificText(page.extract, entity, planEntities),
+            title: page.source === '自定义搜索 AI' ? canonicalName : page.title,
+            extract: extractEntitySpecificText(page.extract, canonicalName, [...planEntities, ...aliases]),
         })).filter(page => page.extract && ([page.title, page.extract]
-            .some(value => String(value ?? '').toLowerCase().includes(entity.toLowerCase()))));
+            .some(value => aliases.some(alias => String(value ?? '').toLowerCase().includes(alias.toLowerCase())))));
         if (!relevant.length && !previous?.sources?.length) continue;
         const mergedSources = [...(Array.isArray(previous?.sources) ? previous.sources : []), ...relevant]
             .map(source => ({
@@ -1335,9 +1409,11 @@ async function saveCanonResearch(plan, pages) {
             }))
             .filter((source, index, array) => array.findIndex(other =>
                 `${other.title}|${other.url}|${other.extract}` === `${source.title}|${source.url}|${source.extract}`) === index);
-        database[entity] = {
-            entity,
-            work: plan.work || '',
+        if (previousName && previousName !== canonicalName) delete database[previousName];
+        database[canonicalName] = {
+            entity: canonicalName,
+            aliases,
+            work: canonicalPage?.workTitle || previous?.work || plan.work || '',
             timeline: plan.timeline || '',
             updatedAt: Date.now(),
             canonChanges: [...new Set([
@@ -1346,16 +1422,26 @@ async function saveCanonResearch(plan, pages) {
             ].map(String).filter(Boolean))].slice(0, 20),
             sources: mergedSources,
         };
+        replacements.set(entity, canonicalName);
+    }
+    if (replacements.size) {
+        const replace = values => cleanDetectedEntities(values.map(name => replacements.get(name) || resolveCanonEntityName(name, database)));
+        plan.entities = replace(plan.entities);
+        if (Array.isArray(plan.autoEntities)) plan.autoEntities = replace(plan.autoEntities);
+        const cardProfile = profile();
+        cardProfile.entities = replace(manualEntities(cardProfile.entities)).join('，');
+        cardProfile.lastAutoEntities = replace(Array.isArray(cardProfile.lastAutoEntities) ? cardProfile.lastAutoEntities : []);
     }
     saveSettingsDebounced();
-    await syncCanonDatabaseToWorldBook(planEntities);
+    await syncCanonDatabaseToWorldBook(plan.entities);
 }
 
 function loadCanonResearch(plan) {
     const database = storedCanonEntities();
     const pages = [];
     for (const entity of cleanDetectedEntities(plan.entities)) {
-        const record = database[entity];
+        const recordName = findCanonRecordName(entity, database);
+        const record = database[recordName];
         if (!record || !Array.isArray(record.sources)) continue;
         for (const source of record.sources) {
             pages.push({
@@ -1376,7 +1462,10 @@ function loadCanonResearch(plan) {
 
 function missingCanonEntities(plan) {
     const database = storedCanonEntities();
-    return cleanDetectedEntities(plan.entities).filter(entity => !database[entity]?.sources?.length);
+    return cleanDetectedEntities(plan.entities).filter(entity => {
+        const recordName = findCanonRecordName(entity, database);
+        return !recordName || !database[recordName]?.sources?.length;
+    });
 }
 
 async function retrieve(plan) {
@@ -1402,7 +1491,16 @@ async function retrieve(plan) {
         if (useWeb && !batchCustomAi) jobs.push(searchWeb(query));
     }
     if (batchCustomAi && plan.queries.length) {
-        const batchQuery = `请在一次联网研究中核实下列同人对象。先自行查阅和交叉核对权威资料，但回答正文不要写网址、参考资料列表或引用编号。只输出合法 JSON：{"records":[{"entity":"必须与研究对象名称完全一致","summary":"必须以该对象的准确名称开头；给写作模型使用的完整角色档案；只写确认事实，紧凑无重复；按适用情况包含身份、年龄、外貌身材、典型穿着、性格与行为逻辑、能力、重要经历、人际关系、说话风格及不可违背的核心设定"}]}。不要限制档案长度；每个对象单独一条，不得把其他对象资料混入。没有可靠原作对应的对象不要返回记录，也不要为其猜测别名。\n\n研究对象：\n${cleanDetectedEntities(plan.entities).map((entity, index) => `${index + 1}. ${entity}`).join('\n')}\n\n检索问题：\n${plan.queries.map((query, index) => `${index + 1}. ${query}`).join('\n')}`;
+        const plannedCandidates = cleanEntityCandidates(plan.entityCandidates);
+        const researchObjects = cleanDetectedEntities(plan.entities).map(entity => {
+            const planned = plannedCandidates.find(item => canonicalEntityKey(item.candidateName) === canonicalEntityKey(entity));
+            return {
+                candidateName: entity,
+                workHint: planned?.workHint || '',
+                contextEvidence: planned?.contextEvidence || '',
+            };
+        });
+        const batchQuery = `请在一次联网研究中逐个核实下列同人对象。上下文中的中文名只是候选名，可能是错译、误写或与别的角色混淆；必须先确认其实际所属作品和原文正式姓名，再整理档案。优先使用原作官网、出版社、官方角色页和可靠资料库，并交叉核对。回答中不要写网址、参考资料列表或引用编号。\n\n只输出合法 JSON：{"records":[{"candidateName":"必须原样回填输入候选名，仅用于配对","canonicalName":"核实后的简体中文正式名；可以且应当纠正候选名","originalName":"原文姓名（如日文汉字与假名）","workTitle":"实际所属原作，不得照抄错误的总作品名","aliases":["常见译名、原文名和本次错误候选名"],"verified":true,"summary":"必须以 canonicalName 开头；给正文模型使用的单人完整档案；紧凑无重复；只写确认事实；按适用情况包含身份、年龄、外貌身材、发色发型、典型穿着、性格与行为逻辑、能力、重要经历、人际关系、说话风格及不可违背的核心设定"}]}。不要限制档案长度；每个对象单独一条，绝不能把其他对象资料混入。若候选名错误但能根据作品线索、关系和上下文确认角色，必须返回纠正后的 canonicalName，不能照抄错误候选名。只有确认是用户原创人物或确实无法对应任何原作时才不返回该记录。\n\n研究对象（JSON）：\n${JSON.stringify(researchObjects)}\n\n检索问题：\n${plan.queries.map((query, index) => `${index + 1}. ${query}`).join('\n')}`;
         jobs.push(searchWeb(batchQuery));
     }
     const settled = await Promise.allSettled(jobs);
@@ -1532,13 +1630,19 @@ function buildReference(plan, pages) {
         `[资料 ${index + 1}] ${page.source}｜${page.title}${page.url ? `｜${page.url}` : ''}\n${page.extract}`,
     ).join('\n\n');
     const database = storedCanonEntities();
-    const persistedChanges = cleanDetectedEntities(plan.entities)
-        .flatMap(entity => Array.isArray(database[entity]?.canonChanges) ? database[entity].canonChanges : []);
+    const records = cleanDetectedEntities(plan.entities)
+        .map(entity => database[findCanonRecordName(entity, database)])
+        .filter(Boolean);
+    const persistedChanges = records
+        .flatMap(record => Array.isArray(record?.canonChanges) ? record.canonChanges : []);
+    const nameCorrections = records.flatMap(record => recordAliases(record, record.entity)
+        .filter(alias => canonicalEntityKey(alias) !== canonicalEntityKey(record.entity))
+        .map(alias => `${alias} → ${record.entity}`));
     const allCanonChanges = [...new Set([...(plan.canonChanges || []), ...persistedChanges].map(String).filter(Boolean))];
     const canonChanges = allCanonChanges.length
         ? allCanonChanges.join('；')
         : '本轮没有检测到正文明确声明的新差异；已有角色继续沿用原著资料和既有AU设定';
-    return `<fandom_canon_reference>\n作品：${plan.work || '未确认'}\n当前时间线/AU节点：${plan.timeline || '未确认；必须避免擅自假定具体集数或时期'}\n本轮核实对象：${plan.entities.join('、') || '由上下文判断'}\n本轮明确的原著差异：${canonChanges}\n\n${sources}\n\n写作约束：\n1. 先依据上述资料与角色卡核对外貌、身材、惯常服装、性格、能力、经历和人际关系，再推进剧情。\n2. 角色卡、用户明确设定和本次 AU 高于原作；除此之外保持原作一致。\n3. 严守当前时间线：此节点之后才发生的事件、关系变化、伤亡、能力、秘密和人物认知不得提前出现。\n4. 资料只证明其中明确写出的事实；搜索摘要缺失不代表不存在。${strict ? '没有证据的精确原作事实不得编造，必要时采用不冲突的模糊描写。' : ''}\n5. 不要在正文提及检索、Wiki、资料编号或这些规则，直接自然写作。\n</fandom_canon_reference>`;
+    return `<fandom_canon_reference>\n作品：${plan.work || '未确认'}\n当前时间线/AU节点：${plan.timeline || '未确认；必须避免擅自假定具体集数或时期'}\n本轮核实对象：${plan.entities.join('、') || '由上下文判断'}\n姓名校正：${nameCorrections.length ? [...new Set(nameCorrections)].join('；') : '无'}\n本轮明确的原著差异：${canonChanges}\n\n${sources}\n\n写作约束：\n1. 正文动笔前先依据上述资料核对姓名、外貌、身材、发色发型、惯常服装、性格、能力、经历和人际关系；候选名与资料冲突时必须使用“姓名校正”后的正式名，不得沿用错误译名。\n2. 角色卡、用户明确设定和本次 AU 高于原作；除此之外保持原作一致。\n3. 严守当前时间线：此节点之后才发生的事件、关系变化、伤亡、能力、秘密和人物认知不得提前出现。\n4. 资料只证明其中明确写出的事实；搜索摘要缺失不代表不存在。${strict ? '没有证据的精确原作事实不得编造，必要时采用不冲突的模糊描写。' : ''}\n5. 不要在正文提及检索、Wiki、资料编号或这些规则，直接自然写作。\n</fandom_canon_reference>`;
 }
 
 function updateReport(status, plan = null, pages = []) {
@@ -1580,17 +1684,23 @@ async function runPreflight(chat, type = 'normal', force = false) {
         let fetchedPages = [];
         let timedOut = false;
         if (shouldFetch && plan.queries.length) {
-            const result = await waitForResearch(startCanonEnrichment(plan), settings().searchWaitSeconds);
-            fetchedPages = result.pages;
-            timedOut = result.timedOut;
+            if (missingEntities.length) {
+                updateReport(`检测到新原作对象：${missingEntities.join('、')}；正在先核对正式姓名与完整档案，完成后才进入正文（${elapsed()} 秒）`, plan);
+                fetchedPages = await startCanonEnrichment(plan);
+            } else {
+                const result = await waitForResearch(startCanonEnrichment(plan), settings().searchWaitSeconds);
+                fetchedPages = result.pages;
+                timedOut = result.timedOut;
+            }
         }
-        const pages = [...fetchedPages, ...storedPages].filter((page, index, array) =>
+        const freshStoredPages = loadCanonResearch(plan);
+        const pages = [...freshStoredPages, ...fetchedPages, ...storedPages].filter((page, index, array) =>
             array.findIndex(other => `${other.url}|${other.title}` === `${page.url}|${page.title}`) === index,
         ).slice(0, 10);
         if (!pages.length) {
             updateReport(timedOut
-                ? `新角色资料检索超过 ${settings().searchWaitSeconds} 秒，已转入后台；本轮不再等待，酒馆继续生成（${elapsed()} 秒）`
-                : `未找到资料，本轮不注入（${elapsed()} 秒）`, plan);
+                ? `时间线增量检索超过 ${settings().searchWaitSeconds} 秒，已转入后台；本轮沿用现有资料（${elapsed()} 秒）`
+                : `没有取得可用资料；本轮仅按角色卡与上下文继续，不会把候选译名当成已核实正式名（${elapsed()} 秒）`, plan);
             return;
         }
         const reference = buildReference(plan, pages).slice(0, 24000);
@@ -1624,7 +1734,7 @@ function panelHtml() {
                     <label>Wikipedia 语言<select id="fcr-language"><option value="zh">中文</option><option value="ja">日文</option><option value="en">英文</option></select></label>
                     <label>每次最多查询数<input id="fcr-max-queries" type="number" min="1" max="5" value="${config.maxQueries}"></label>
                     <label>缓存分钟<input id="fcr-cache-minutes" type="number" min="10" max="10080" value="${config.cacheMinutes}"></label>
-                    <label>生成前最多等待检索（秒）<input id="fcr-search-wait" type="number" min="0" max="60" value="${config.searchWaitSeconds}"></label>
+                    <label>已有资料增量检索最多等待（秒）<input id="fcr-search-wait" type="number" min="0" max="60" value="${config.searchWaitSeconds}"></label>
                 </div>
                 <details class="fcr-api-box" open>
                     <summary><i class="fa-solid fa-globe"></i> 搜索 API 配置</summary>

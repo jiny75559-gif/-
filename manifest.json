@@ -4,11 +4,11 @@
   "requires": [],
   "optional": [],
   "generate_interceptor": "fandomCanonPreflight",
-  "js": "index.js?v=2.1.5",
-  "css": "style.css?v=2.1.5",
+  "js": "index.js?v=2.1.6",
+  "css": "style.css?v=2.1.6",
   "author": "晋阳",
   "homePage": "https://github.com/jiny75559-gif/-",
-  "version": "2.1.5",
+  "version": "2.1.6",
   "auto_update": true,
   "minimum_client_version": "1.12.0"
 }
