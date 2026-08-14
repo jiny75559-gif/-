@@ -1730,6 +1730,41 @@ function bindPanel() {
     bindSetting('#fcr-planner', 'autoPlanner', Boolean);
     bindSetting('#fcr-auto-update-profile', 'autoUpdateProfile', Boolean);
     bindSetting('#fcr-strict', 'strictMode', Boolean);
+
+    // Some Android WebViews render SillyTavern's custom checkbox correctly but
+    // fail to synthesize the label click after a touch. Handle a stationary
+    // touch explicitly and suppress only its duplicate synthetic click.
+    document.querySelectorAll(`#${PANEL_ID} .checkbox_label`).forEach(label => {
+        const input = label.querySelector('input[type="checkbox"]');
+        if (!(input instanceof HTMLInputElement)) return;
+        let touchStart = null;
+        let handledAt = 0;
+        label.addEventListener('touchstart', event => {
+            const touch = event.changedTouches?.[0];
+            touchStart = touch ? { id: touch.identifier, x: touch.clientX, y: touch.clientY } : null;
+        }, { passive: true });
+        label.addEventListener('touchend', event => {
+            if (!touchStart) return;
+            const touch = [...(event.changedTouches ?? [])].find(item => item.identifier === touchStart.id);
+            const moved = !touch || Math.hypot(touch.clientX - touchStart.x, touch.clientY - touchStart.y) > 12;
+            touchStart = null;
+            if (moved || input.disabled) return;
+            event.preventDefault();
+            event.stopPropagation();
+            input.checked = !input.checked;
+            handledAt = Date.now();
+            input.dispatchEvent(new Event('change', { bubbles: true }));
+        }, { passive: false });
+        label.addEventListener('touchcancel', () => {
+            touchStart = null;
+        }, { passive: true });
+        label.addEventListener('click', event => {
+            if (Date.now() - handledAt >= 700) return;
+            event.preventDefault();
+            event.stopPropagation();
+        }, true);
+    });
+
     bindSetting('#fcr-language', 'language', String);
     bindSetting('#fcr-max-queries', 'maxQueries', value => clampInt(value, 1, 5, 3));
     bindSetting('#fcr-cache-minutes', 'cacheMinutes', value => clampInt(value, 10, 10080, 360));
