@@ -1,0 +1,38 @@
+# 晋阳的同人库
+
+一个纯前端 SillyTavern 扩展。它会读取当前角色卡、聊天上下文以及实际启用的世界书条目，在生成前规划检索、核对同人角色与原作时间线，并把精简资料持久同步到角色绑定的世界书。
+
+## 安装
+
+1. 打开 SillyTavern 的“扩展”面板。
+2. 点击“安装扩展”。
+3. 粘贴本仓库的 Git URL 并安装。
+4. 刷新页面，从输入框旁的扩展菜单打开“晋阳的同人库”。
+
+仓库根目录就是扩展目录，无需修改 SillyTavern 服务端源码。
+
+## 每位用户独立配置 API
+
+- Wiki 模式免费且无需 Key。
+- Tavily、Serper、SerpApi 使用 SillyTavern 自带的用户密钥库。
+- 自定义搜索 AI（Grok、OpenAI 兼容中转等）和独立分析 LLM 的 Key 只保存在当前浏览器的 `localStorage`，并按 SillyTavern 用户账号隔离。
+- Key 不会写入角色卡、世界书、聊天、扩展设置或 Git 仓库。
+- 换手机、电脑或浏览器后，需要在新设备重新填写 Key。
+
+## 自定义 API 要求
+
+自定义 API 应兼容以下端点：
+
+- `GET /v1/models`
+- 分析：`POST /v1/chat/completions`
+- 联网搜索：`POST /v1/responses` 并支持 `web_search`，或提供自身具备联网能力的 `POST /v1/chat/completions`
+
+插件优先由浏览器直连 API；模型列表、分析请求及 Chat Completions 搜索在跨域受限时会自动使用 SillyTavern 自带的通用代理，仍不需要修改服务端源码。Responses API 联网搜索必须使用 HTTPS，并允许浏览器跨域访问（CORS）。
+
+## 隐私与安全
+
+浏览器本地存储可防止 Key 被发布或混入酒馆数据，但同源网页脚本理论上能够访问它。请只安装可信的 SillyTavern 扩展，使用权限受限的独立 Key，并定期轮换。设置页提供“删除此设备 Key”按钮。
+
+## 更新
+
+扩展启用了 `auto_update`。通过 Git URL 安装后，可以使用 SillyTavern 的扩展更新功能获取新版本。
