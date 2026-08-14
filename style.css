@@ -11,6 +11,29 @@
     filter: drop-shadow(0 0 4px rgba(216, 183, 125, 0.55));
 }
 
+/* SillyTavern's chat swipe arrows use z-index: 9999. Some mobile themes keep
+ * those arrows visible above generic popups, where they steal touch events. */
+.popup:has(#fandom-canon-settings) {
+    z-index: 10001 !important;
+    pointer-events: auto !important;
+    isolation: isolate;
+}
+
+body:has(.popup #fandom-canon-settings) :is(.swipe_left, .swipe_right, .swipes-counter) {
+    visibility: hidden !important;
+    pointer-events: none !important;
+}
+
+#fandom-canon-settings,
+#fandom-canon-settings .inline-drawer-content,
+#fandom-canon-settings .checkbox_label,
+#fandom-canon-settings input,
+#fandom-canon-settings select,
+#fandom-canon-settings textarea,
+#fandom-canon-settings button {
+    pointer-events: auto !important;
+}
+
 .fandom-canon-panel.fcr-popup-mode {
     width: min(920px, 92vw);
     text-align: left;
@@ -201,7 +224,11 @@
         align-items: flex-start;
         gap: 7px;
         margin: 5px 0;
+        min-height: 38px;
+        padding: 7px 2px;
         line-height: 1.35;
+        cursor: pointer;
+        touch-action: manipulation;
     }
 
     .fandom-canon-panel .checkbox_label input {
