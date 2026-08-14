@@ -1,0 +1,142 @@
+.fandom-canon-panel .inline-drawer-content {
+    padding: 8px 10px 14px;
+}
+
+#fandom-canon-quick-button {
+    color: var(--SmartThemeBodyColor);
+}
+
+#fandom-canon-quick-button:hover {
+    color: #d8b77d;
+    filter: drop-shadow(0 0 4px rgba(216, 183, 125, 0.55));
+}
+
+.fandom-canon-panel.fcr-popup-mode {
+    width: min(920px, 92vw);
+    text-align: left;
+}
+
+.fandom-canon-panel.fcr-popup-mode > .inline-drawer > .inline-drawer-toggle {
+    pointer-events: none;
+}
+
+.fandom-canon-panel.fcr-popup-mode .inline-drawer-icon {
+    display: none;
+}
+
+.fandom-canon-panel label:not(.checkbox_label) {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    margin: 9px 0;
+}
+
+.fcr-grid {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 8px;
+    margin-top: 8px;
+}
+
+.fcr-grid label {
+    margin: 0 !important;
+}
+
+.fcr-grid input,
+.fcr-grid select {
+    min-width: 0;
+}
+
+.fcr-card-title {
+    margin: 12px 0 4px;
+    padding: 7px 9px;
+    border-left: 3px solid #b69662;
+    background: rgba(182, 150, 98, 0.1);
+}
+
+.fcr-api-box {
+    margin: 12px 0;
+    padding: 9px 11px;
+    border: 1px solid rgba(182, 150, 98, 0.34);
+    border-radius: 7px;
+    background: rgba(182, 150, 98, 0.06);
+}
+
+.fcr-api-box > summary {
+    cursor: pointer;
+    font-weight: 700;
+}
+
+.fcr-api-actions,
+.fcr-actions {
+    align-items: center;
+}
+
+.fcr-api-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 9px;
+    margin-top: 8px;
+}
+
+.fcr-key-state {
+    color: #d9a36c;
+}
+
+.fcr-key-state.fcr-key-ok {
+    color: #86c98b;
+}
+
+.fcr-help {
+    margin-top: 7px;
+    opacity: 0.72;
+    font-size: 0.88em;
+}
+
+.fcr-llm-grid {
+    margin-top: 8px;
+}
+
+.fcr-llm-grid label:first-child {
+    grid-column: span 2;
+}
+
+.fcr-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin-top: 10px;
+}
+
+.fcr-actions .menu_button,
+.fcr-api-actions .menu_button {
+    width: auto !important;
+    min-width: 145px;
+    min-height: 38px;
+    white-space: nowrap;
+}
+
+.fcr-report {
+    margin-top: 10px;
+    padding: 9px 10px;
+    border: 1px solid rgba(182, 150, 98, 0.3);
+    border-radius: 6px;
+    background: rgba(0, 0, 0, 0.12);
+    font-size: 0.9em;
+    line-height: 1.55;
+    overflow-wrap: anywhere;
+}
+
+.fcr-report details {
+    margin-top: 5px;
+}
+
+.fcr-report a {
+    color: #d8b77d;
+}
+
+@media (max-width: 700px) {
+    .fcr-grid {
+        grid-template-columns: 1fr;
+    }
+}
