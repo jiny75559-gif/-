@@ -218,7 +218,7 @@
         margin: 6px 0;
     }
 
-    .fandom-canon-panel input,
+    .fandom-canon-panel input:not([type="checkbox"]),
     .fandom-canon-panel select,
     .fandom-canon-panel textarea {
         box-sizing: border-box;
@@ -234,6 +234,18 @@
     .fandom-canon-panel textarea {
         min-height: 74px;
         resize: vertical;
+    }
+
+    .fandom-canon-panel .checkbox_label input[type="checkbox"] {
+        display: inline-block;
+        flex: 0 0 auto;
+        width: 1.15em !important;
+        max-width: 1.15em !important;
+        height: 1.15em !important;
+        min-width: 1.15em !important;
+        min-height: 1.15em !important;
+        margin: 0.12em 0 0 !important;
+        padding: 0 !important;
     }
 
     .fcr-api-box {
