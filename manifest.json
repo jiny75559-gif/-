@@ -6,7 +6,8 @@
   "generate_interceptor": "fandomCanonPreflight",
   "js": "index.js?v=2.0.2",
   "css": "style.css?v=2.0.2",
-  "author": "Codex",
+  "author": "晋阳",
+  "homePage": "https://github.com/jiny75559-gif/-",
   "version": "2.0.2",
   "auto_update": true,
   "minimum_client_version": "1.12.0"
