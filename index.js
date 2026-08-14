@@ -20,7 +20,7 @@ const QUICK_BUTTON_ID = 'fandom-canon-quick-button';
 const MENU_ENTRY_ID = 'fandom-canon-menu-entry';
 const LOCAL_CREDENTIAL_PREFIX = 'sillytavern-fandom-canon-retriever';
 const WORLD_ENTRY_PREFIX = '【同人原作资料库·插件自动维护】';
-const EXTENSION_VERSION = '2.1.4';
+const EXTENSION_VERSION = '2.1.5';
 const DEFAULTS = {
     enabled: true,
     language: 'zh',
@@ -582,16 +582,35 @@ async function detectSearchAiModels() {
 }
 
 function manualEntities(value) {
-    return String(value ?? '').split(/[，,、\n]/).map(x => x.trim()).filter(Boolean).slice(0, 40);
+    return String(value ?? '').split(/[，,、\n]/).map(normalizeEntityDisplay).filter(Boolean).slice(0, 40);
 }
 
 const GENERIC_RESEARCH_TERMS = new Set(['兄妹', '姐妹', '兄弟', '家人', '家庭', '角色', '人物', '主角', '配角', 'oc', '原创角色', '同人', '剧情', '故事', '冒险', '角色卡']);
 const INVALID_ENTITY_PATTERNS = [/法定(?:饮酒|吸烟|成年|结婚)?年龄/i, /^\d{4}年.*趋势$/i, /^(?:法律|法规|规则|规定|年龄限制)$/i];
+const ENTITY_NAME_VARIANTS = new Map(Object.entries({
+    錦: '锦', 瀧: '泷', 澤: '泽', 邊: '边', 邉: '边', 齊: '齐', 齋: '斋', 國: '国', 戶: '户', 櫻: '樱', 條: '条',
+    廣: '广', 髙: '高', 﨑: '崎', 龍: '龙', 鳳: '凤', 亞: '亚', 眞: '真', 榮: '荣', 優: '优', 結: '结',
+    愛: '爱', 夢: '梦', 葉: '叶', 遙: '遥', 曉: '晓', 暁: '晓', 島: '岛', 門: '门', 風: '风', 雲: '云',
+}));
+
+function normalizeEntityDisplay(value) {
+    return String(value ?? '')
+        .normalize('NFKC')
+        .trim()
+        .replace(/\s+/g, ' ')
+        .replace(/[錦瀧澤邊邉齊齋國戶櫻條廣髙﨑龍鳳亞眞榮優結愛夢葉遙曉暁島門風雲]/g, character => ENTITY_NAME_VARIANTS.get(character) || character);
+}
+
+function canonicalEntityKey(value) {
+    return normalizeEntityDisplay(value)
+        .toLocaleLowerCase()
+        .replace(/[\s·・•._\-—–,，、:：'"“”‘’()（）\[\]【】{}《》〈〉]/g, '');
+}
 
 function cleanDetectedEntities(values) {
     return [...new Set((Array.isArray(values) ? values : [])
         .map(String)
-        .map(value => value.trim())
+        .map(normalizeEntityDisplay)
         .filter(value => value.length >= 2
             && !GENERIC_RESEARCH_TERMS.has(value.toLowerCase())
             && !INVALID_ENTITY_PATTERNS.some(pattern => pattern.test(value))))]
@@ -1035,11 +1054,73 @@ function extractEntitySpecificText(value, entity, candidateEntities = []) {
     return containsAnotherEntity ? '' : raw;
 }
 
+function consolidateCanonAliases(database, cardProfile) {
+    const groups = new Map();
+    for (const name of Object.keys(database)) {
+        const key = canonicalEntityKey(name);
+        if (!key) continue;
+        if (!groups.has(key)) groups.set(key, []);
+        groups.get(key).push(name);
+    }
+
+    let changed = false;
+    const replacements = new Map();
+    for (const names of groups.values()) {
+        const normalizedNames = names.map(normalizeEntityDisplay);
+        const preferredName = normalizedNames.find((name, index) => name === names[index])
+            || normalizedNames[0];
+        if (names.length === 1 && names[0] === preferredName) continue;
+
+        const records = names.map(name => database[name]).filter(Boolean);
+        const quality = record => (record?.sources || []).reduce((total, source) => total + String(source?.extract || '').length, 0);
+        const preferredRecord = records.find(record => String(record?.entity || '') === preferredName)
+            || [...records].sort((a, b) => quality(b) - quality(a))[0]
+            || {};
+        const sourceMap = new Map();
+        for (const record of records) {
+            for (const source of (Array.isArray(record?.sources) ? record.sources : [])) {
+                const normalizedTitle = canonicalEntityKey(source?.title) === canonicalEntityKey(preferredName)
+                    ? preferredName
+                    : String(source?.title || '');
+                const normalizedSource = { ...source, title: normalizedTitle };
+                const sourceKey = `${normalizedSource.source || ''}|${canonicalEntityKey(normalizedTitle)}|${normalizedSource.url || ''}`;
+                const previous = sourceMap.get(sourceKey);
+                if (!previous || String(normalizedSource.extract || '').length > String(previous.extract || '').length) {
+                    sourceMap.set(sourceKey, normalizedSource);
+                }
+            }
+        }
+
+        const merged = {
+            ...preferredRecord,
+            entity: preferredName,
+            work: preferredRecord.work || records.find(record => record?.work)?.work || '',
+            timeline: preferredRecord.timeline || records.find(record => record?.timeline)?.timeline || '',
+            updatedAt: Math.max(0, ...records.map(record => Number(record?.updatedAt) || 0)),
+            canonChanges: [...new Set(records.flatMap(record => Array.isArray(record?.canonChanges) ? record.canonChanges : []).map(String).filter(Boolean))],
+            sources: [...sourceMap.values()],
+        };
+        for (const name of names) {
+            replacements.set(name, preferredName);
+            if (name !== preferredName) delete database[name];
+        }
+        database[preferredName] = merged;
+        changed = true;
+    }
+
+    if (changed) {
+        const replaceNames = values => cleanDetectedEntities(values.map(name => replacements.get(name) || name));
+        cardProfile.entities = replaceNames(manualEntities(cardProfile.entities)).join('，');
+        cardProfile.lastAutoEntities = replaceNames(Array.isArray(cardProfile.lastAutoEntities) ? cardProfile.lastAutoEntities : []);
+    }
+    return changed;
+}
+
 function sanitizeCanonDatabase(database, cardProfile = profile()) {
     const entities = Object.keys(database);
     let changed = false;
     const removedEntities = new Set();
-    const rejectedProfile = /无原作对应|未(?:在|能).*发现|音译变体|误写|混淆|并非独立实体/i;
+    const rejectedProfile = /无原作对应|未(?:在|能).*发现|音译变体|误写|混淆|并非独立实体|原作.*(?:登場しない|存在しない)|公式.*(?:記述|確認).*(?:ない|ず)|記録対象外/i;
     for (const entity of entities) {
         const record = database[entity];
         if (!cleanDetectedEntities([entity]).length || !record) {
@@ -1071,7 +1152,8 @@ function sanitizeCanonDatabase(database, cardProfile = profile()) {
             changed = true;
         }
     }
-    const preferredEntities = manualEntities(profile().entities);
+    changed = consolidateCanonAliases(database, cardProfile) || changed;
+    const preferredEntities = manualEntities(cardProfile.entities);
     const normalizeFamily = value => String(value || '').replaceAll('結', '结').slice(0, 2);
     for (const entity of Object.keys(database)) {
         if (preferredEntities.includes(entity)) continue;
