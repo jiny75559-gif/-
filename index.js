@@ -20,7 +20,7 @@ const QUICK_BUTTON_ID = 'fandom-canon-quick-button';
 const MENU_ENTRY_ID = 'fandom-canon-menu-entry';
 const LOCAL_CREDENTIAL_PREFIX = 'sillytavern-fandom-canon-retriever';
 const WORLD_ENTRY_PREFIX = '【同人原作资料库·插件自动维护】';
-const EXTENSION_VERSION = '2.1.6';
+const EXTENSION_VERSION = '2.1.7';
 const DEFAULTS = {
     enabled: true,
     language: 'zh',
@@ -654,6 +654,39 @@ function resolveCanonEntityName(candidate, database = storedCanonEntities()) {
     return findCanonRecordName(candidate, database) || normalizeEntityDisplay(candidate);
 }
 
+function normalizeChangeText(value) {
+    return String(value ?? '')
+        .normalize('NFKC')
+        .toLocaleLowerCase()
+        .replace(/[\s\p{P}\p{S}]+/gu, '')
+        .replace(/[的了着]/g, '');
+}
+
+function textBigrams(value) {
+    const normalized = normalizeChangeText(value);
+    if (normalized.length < 2) return new Set([normalized]);
+    return new Set(Array.from({ length: normalized.length - 1 }, (_, index) => normalized.slice(index, index + 2)));
+}
+
+function changesAreEquivalent(left, right) {
+    const a = normalizeChangeText(left);
+    const b = normalizeChangeText(right);
+    if (!a || !b) return false;
+    if (a === b || (Math.min(a.length, b.length) >= 18 && (a.includes(b) || b.includes(a)))) return true;
+    const aPairs = textBigrams(a);
+    const bPairs = textBigrams(b);
+    const intersection = [...aPairs].filter(pair => bPairs.has(pair)).length;
+    const union = new Set([...aPairs, ...bPairs]).size;
+    return union > 0 && intersection / union >= 0.78;
+}
+
+function cleanCanonChanges(values) {
+    return (Array.isArray(values) ? values : [])
+        .map(value => typeof value === 'string' ? value : value?.change)
+        .map(value => String(value ?? '').trim())
+        .filter(Boolean);
+}
+
 function cleanPlannedQueries(values, work = '') {
     return [...new Set((Array.isArray(values) ? values : [])
         .map(String)
@@ -693,7 +726,8 @@ async function planQueries(chat) {
     }
 
     const source = await researchContext(chat);
-    const plannerPrompt = `你是同人写作前的资料检索规划器。必须先阅读角色卡正文、世界书和最近剧情，再找出本轮续写真正需要外部核实的原作人物、地点、组织、事件或时间线节点。角色卡标题只是文件名，绝不能仅凭标题生成实体或搜索词。候选中文译名可能是正文模型写错的，只把它当检索线索，不得认定为正式名。\n\n作品（当前表值）：${work || '未填写，请从正文判断'}\n当前时间线/AU节点（上轮表值）：${cardProfile.timeline || '未填写'}\n用户手动固定实体：${fixedEntities.join('、') || '无'}\n\n角色卡正文：\n${source.card || '未读取到'}\n\n本轮实际激活世界书：\n${source.worldInfo || '无'}\n\n最近剧情：\n${source.recent || '无'}\n\n只输出 JSON，不写解释：{"work":"有明确证据的原作名，否则沿用当前作品","storyType":"canon_timeline|au_timeline|original_world_with_fandom_characters|original_only|unknown","timeline":"当前剧情线","timelineChanged":false,"entities":[{"candidateName":"上下文里的候选名","isOriginal":false,"workHint":"该人物实际所属作品；不确定留空","contextEvidence":"为何判断此人即将或刚刚登场的简短证据"}],"canonChanges":["正文明确说明的角色或剧情相对原著变化"],"queries":["仅用于已有档案的明确新增差异或重大时间线变化"]}\n规则：逐个判断人物是否为用户原创角色；原创人物 isOriginal=true，不外搜。新原作角色首先需要完整基础档案，不能把饮食、喝酒、车辆等当前场景琐事当成主档案。queries 最多 ${config.maxQueries} 条；不得使用“兄妹”“冒险”“OC”等泛称或角色卡标题；仅含同人角色但剧情属于用户原创世界时，不得硬套原作时间节点。每个候选人的 workHint 必须依据角色卡、已激活世界书和上下文单独判断，禁止把多作品卡的总标题强套给所有人。只有篇章、原作事件阶段、AU关键状态或重大剧情线确实变化时，timelineChanged 才能为 true；普通对话、日常推进、换地点或时间流逝不得改写上轮时间线。已有角色默认沿用原著与缓存，只有正文明确给出相对原著的差异时才写入 canonChanges。`;
+    const existingChanges = Object.values(database).flatMap(record => Array.isArray(record?.canonChanges) ? record.canonChanges : []);
+    const plannerPrompt = `你是同人写作前的资料检索规划器。必须先阅读角色卡正文、世界书和最近剧情，再找出本轮续写真正需要外部核实的原作人物、地点、组织、事件或时间线节点。角色卡标题只是文件名，绝不能仅凭标题生成实体或搜索词。候选中文译名可能是正文模型写错的，只把它当检索线索，不得认定为正式名。\n\n作品（当前表值）：${work || '未填写，请从正文判断'}\n当前时间线/AU节点（上轮表值）：${cardProfile.timeline || '未填写'}\n用户手动固定实体：${fixedEntities.join('、') || '无'}\n已经保存的 AU 差异（不得重复返回或改写复述）：\n${existingChanges.length ? existingChanges.join('\n') : '无'}\n\n角色卡正文：\n${source.card || '未读取到'}\n\n本轮实际激活世界书：\n${source.worldInfo || '无'}\n\n最近剧情：\n${source.recent || '无'}\n\n只输出 JSON，不写解释：{"work":"有明确证据的原作名，否则沿用当前作品","storyType":"canon_timeline|au_timeline|original_world_with_fandom_characters|original_only|unknown","timeline":"当前剧情线","timelineChanged":false,"entities":[{"candidateName":"上下文里的候选名","isOriginal":false,"workHint":"该人物实际所属作品；不确定留空","contextEvidence":"为何判断此人即将或刚刚登场的简短证据"}],"canonChanges":["仅写本轮正文首次明确出现、且上方已保存列表中不存在的新差异；格式为角色正式名：变化"],"queries":["仅用于重大时间线变化后需要补查的官方设定；无变化必须为空数组"]}\n规则：逐个判断人物是否为用户原创角色；原创人物 isOriginal=true，不外搜。新原作角色首先需要完整基础档案，不能把饮食、喝酒、车辆等当前场景琐事当成主档案。queries 最多 ${config.maxQueries} 条；不得使用“兄妹”“冒险”“OC”等泛称或角色卡标题；仅含同人角色但剧情属于用户原创世界时，不得硬套原作时间节点。每个候选人的 workHint 必须依据角色卡、已激活世界书和上下文单独判断，禁止把多作品卡的总标题强套给所有人。只有篇章、原作事件阶段、AU关键状态确实跨越到一个不同节点时，timelineChanged 才能为 true；普通对话、日常推进、换地点、时间流逝或对同一节点换一种说法都必须为 false。已有角色的基础档案绝不重复搜索；AU 差异来自本卡正文，直接增量保存，不需要联网搜索。`;
 
     try {
         const parsed = await runJsonAnalysisPrompt(plannerPrompt, 1800);
@@ -716,14 +750,17 @@ async function planQueries(chat) {
             const workHint = candidate?.workHint || (shouldAttachWorkTitle(plannedWork) ? plannedWork : '');
             return `${entity} ${workHint} 核对正式姓名及原作完整角色档案：身份、年龄、外貌身材、典型穿着、性格行为逻辑、能力、重要经历、人际关系、说话风格`.trim();
         });
+        const proposedTimeline = String(parsed.timeline ?? '').trim();
+        const actualTimelineChanged = parsed.timelineChanged === true
+            && normalizeChangeText(proposedTimeline) !== normalizeChangeText(cardProfile.timeline);
         const queries = baselineQueries.length
             ? baselineQueries
-            : (parsed.timelineChanged === true || (Array.isArray(parsed.canonChanges) && parsed.canonChanges.length) ? deltaQueries : []);
+            : (actualTimelineChanged ? deltaQueries : []);
         const manualTimeline = cardProfile.timeline.trim() && cardProfile.timeline.trim() !== cardProfile.lastAutoTimeline
             ? cardProfile.timeline.trim()
             : '';
-        const inferredTimeline = parsed.timelineChanged === true
-            ? String(parsed.timeline ?? '').trim()
+        const inferredTimeline = actualTimelineChanged
+            ? proposedTimeline
             : cardProfile.timeline.trim();
         return {
             work: plannedWork,
@@ -733,8 +770,9 @@ async function planQueries(chat) {
             entities: cleanDetectedEntities(entities.map(entity => resolveCanonEntityName(entity, database))),
             entityCandidates: detectedCanonCandidates,
             autoEntities: cleanDetectedEntities(detectedEntities.map(entity => resolveCanonEntityName(entity, database))),
-            canonChanges: Array.isArray(parsed.canonChanges) ? parsed.canonChanges.map(String).filter(Boolean) : [],
-            timelineChanged: parsed.timelineChanged === true,
+            canonChanges: cleanCanonChanges(parsed.canonChanges),
+            timelineChanged: actualTimelineChanged,
+            researchMode: baselineQueries.length ? 'new_entities' : (queries.length ? 'official_delta' : 'none'),
             queries: [...new Set(queries)].slice(0, config.maxQueries),
         };
     } catch (error) {
@@ -752,6 +790,14 @@ async function planQueries(chat) {
 function syncProfileFromPlan(plan) {
     if (!settings().autoUpdateProfile || !plan) return;
     const cardProfile = profile();
+    const before = JSON.stringify({
+        workTitle: cardProfile.workTitle,
+        timeline: cardProfile.timeline,
+        entities: cardProfile.entities,
+        lastAutoWorkTitle: cardProfile.lastAutoWorkTitle,
+        lastAutoTimeline: cardProfile.lastAutoTimeline,
+        lastAutoEntities: cardProfile.lastAutoEntities,
+    });
     const currentEntities = manualEntities(cardProfile.entities);
     const previousAutoEntities = cleanDetectedEntities(cardProfile.lastAutoEntities);
     const manualFixed = currentEntities.filter(entity => !previousAutoEntities.includes(entity));
@@ -771,8 +817,18 @@ function syncProfileFromPlan(plan) {
     }
     cardProfile.entities = nextEntities.join('，');
     cardProfile.lastAutoEntities = nextAutoEntities;
-    saveSettingsDebounced();
-    loadProfileIntoPanel();
+    const after = JSON.stringify({
+        workTitle: cardProfile.workTitle,
+        timeline: cardProfile.timeline,
+        entities: cardProfile.entities,
+        lastAutoWorkTitle: cardProfile.lastAutoWorkTitle,
+        lastAutoTimeline: cardProfile.lastAutoTimeline,
+        lastAutoEntities: cardProfile.lastAutoEntities,
+    });
+    if (before !== after) {
+        saveSettingsDebounced();
+        loadProfileIntoPanel();
+    }
 }
 
 function normalizeApiUrl(input) {
@@ -1308,11 +1364,13 @@ async function syncCanonDatabaseToWorldBook(entities) {
         if (!record?.sources?.length) continue;
         const comment = worldEntryComment(entity);
         let entry = Object.values(data.entries).find(item => item?.comment === comment);
+        let isNew = false;
         if (!entry) {
             entry = createWorldInfoEntry(worldName, data);
             if (!entry) continue;
+            isNew = true;
         }
-        Object.assign(entry, {
+        const desired = {
             key: recordAliases(record, entity),
             keysecondary: [],
             comment,
@@ -1332,8 +1390,13 @@ async function syncCanonDatabaseToWorldBook(entities) {
                 names: characterFile ? [characterFile] : [],
                 tags: [],
             },
-        });
-        changed = true;
+        };
+        const needsUpdate = isNew || Object.entries(desired)
+            .some(([key, value]) => JSON.stringify(entry[key]) !== JSON.stringify(value));
+        if (needsUpdate) {
+            Object.assign(entry, desired);
+            changed = true;
+        }
     }
     if (changed || databaseChanged) {
         await saveWorldInfo(worldName, data, true);
@@ -1363,12 +1426,55 @@ async function clearCanonWorldBookEntries() {
     }
 }
 
+function targetRecordsForChange(change, planEntities, database) {
+    const normalizedChange = normalizeChangeText(change);
+    const matches = Object.entries(database).filter(([name, record]) =>
+        recordAliases(record, name).some(alias => normalizedChange.includes(normalizeChangeText(alias))));
+    if (matches.length) return matches.map(([name]) => name);
+    const planned = cleanDetectedEntities(planEntities)
+        .map(entity => findCanonRecordName(entity, database) || normalizeEntityDisplay(entity))
+        .filter(Boolean);
+    const explicitlyMentioned = planned.filter(name => normalizedChange.includes(normalizeChangeText(name)));
+    if (explicitlyMentioned.length) return explicitlyMentioned;
+    return planned.length === 1 ? planned : [];
+}
+
+function novelChangesForRecord(changes, recordName, planEntities, database) {
+    const existing = Array.isArray(database[recordName]?.canonChanges) ? database[recordName].canonChanges : [];
+    return cleanCanonChanges(changes)
+        .filter(change => targetRecordsForChange(change, planEntities, database).includes(recordName))
+        .filter(change => !existing.some(saved => changesAreEquivalent(change, saved)))
+        .filter((change, index, array) => !array.slice(0, index).some(saved => changesAreEquivalent(change, saved)));
+}
+
+async function persistCanonDeltas(plan) {
+    const database = storedCanonEntities();
+    const changedEntities = new Set();
+    for (const recordName of Object.keys(database)) {
+        const record = database[recordName];
+        const additions = novelChangesForRecord(plan.canonChanges, recordName, plan.entities, database);
+        const timelineChanged = plan.timelineChanged
+            && cleanDetectedEntities(plan.entities).some(entity => findCanonRecordName(entity, database) === recordName)
+            && normalizeChangeText(record.timeline) !== normalizeChangeText(plan.timeline);
+        if (!additions.length && !timelineChanged) continue;
+        if (additions.length) record.canonChanges = [...(Array.isArray(record.canonChanges) ? record.canonChanges : []), ...additions];
+        if (timelineChanged) record.timeline = plan.timeline;
+        record.updatedAt = Date.now();
+        changedEntities.add(recordName);
+    }
+    if (!changedEntities.size) return [];
+    saveSettingsDebounced();
+    await syncCanonDatabaseToWorldBook([...changedEntities]);
+    return [...changedEntities];
+}
+
 async function saveCanonResearch(plan, pages) {
     if (!Array.isArray(pages) || !pages.length) return;
     const database = storedCanonEntities();
     const planEntities = cleanDetectedEntities(plan.entities);
     sanitizeCanonDatabase(database);
     const replacements = new Map();
+    const modifiedEntities = new Set();
     for (const entity of planEntities) {
         const matchesEntity = page => {
             const names = cleanDetectedEntities([
@@ -1393,14 +1499,16 @@ async function saveCanonResearch(plan, pages) {
             canonicalPage?.originalName,
             ...(Array.isArray(canonicalPage?.aliases) ? canonicalPage.aliases : []),
         ]);
+        const previousSources = Array.isArray(previous?.sources) ? previous.sources : [];
         const relevant = pages.filter(page => page.source !== '自定义搜索 AI' || matchesEntity(page)).map(page => ({
             ...page,
             title: page.source === '自定义搜索 AI' ? canonicalName : page.title,
             extract: extractEntitySpecificText(page.extract, canonicalName, [...planEntities, ...aliases]),
         })).filter(page => page.extract && ([page.title, page.extract]
-            .some(value => aliases.some(alias => String(value ?? '').toLowerCase().includes(alias.toLowerCase())))));
+            .some(value => aliases.some(alias => String(value ?? '').toLowerCase().includes(alias.toLowerCase())))))
+            .filter(page => !previousSources.some(source => changesAreEquivalent(page.extract, source.extract)));
         if (!relevant.length && !previous?.sources?.length) continue;
-        const mergedSources = [...(Array.isArray(previous?.sources) ? previous.sources : []), ...relevant]
+        const mergedSources = [...previousSources, ...relevant]
             .map(source => ({
                 title: source.title,
                 url: source.url,
@@ -1409,19 +1517,29 @@ async function saveCanonResearch(plan, pages) {
             }))
             .filter((source, index, array) => array.findIndex(other =>
                 `${other.title}|${other.url}|${other.extract}` === `${source.title}|${source.url}|${source.extract}`) === index);
-        if (previousName && previousName !== canonicalName) delete database[previousName];
-        database[canonicalName] = {
+        const newChanges = novelChangesForRecord(plan.canonChanges, previousName || canonicalName, planEntities, database);
+        const nextRecord = {
             entity: canonicalName,
             aliases,
             work: canonicalPage?.workTitle || previous?.work || plan.work || '',
-            timeline: plan.timeline || '',
-            updatedAt: Date.now(),
+            timeline: plan.timeline || previous?.timeline || '',
+            updatedAt: previous?.updatedAt || Date.now(),
             canonChanges: [...new Set([
                 ...(Array.isArray(previous?.canonChanges) ? previous.canonChanges : []),
-                ...(Array.isArray(plan.canonChanges) ? plan.canonChanges : []),
-            ].map(String).filter(Boolean))].slice(0, 20),
+                ...newChanges,
+            ].map(String).filter(Boolean))],
             sources: mergedSources,
         };
+        const previousComparable = previous ? { ...previous, updatedAt: 0 } : null;
+        const nextComparable = { ...nextRecord, updatedAt: 0 };
+        const recordChanged = previousName !== canonicalName
+            || JSON.stringify(previousComparable) !== JSON.stringify(nextComparable);
+        if (recordChanged) {
+            nextRecord.updatedAt = Date.now();
+            if (previousName && previousName !== canonicalName) delete database[previousName];
+            database[canonicalName] = nextRecord;
+            modifiedEntities.add(canonicalName);
+        }
         replacements.set(entity, canonicalName);
     }
     if (replacements.size) {
@@ -1432,8 +1550,10 @@ async function saveCanonResearch(plan, pages) {
         cardProfile.entities = replace(manualEntities(cardProfile.entities)).join('，');
         cardProfile.lastAutoEntities = replace(Array.isArray(cardProfile.lastAutoEntities) ? cardProfile.lastAutoEntities : []);
     }
-    saveSettingsDebounced();
-    await syncCanonDatabaseToWorldBook(plan.entities);
+    if (modifiedEntities.size) {
+        saveSettingsDebounced();
+        await syncCanonDatabaseToWorldBook([...modifiedEntities]);
+    }
 }
 
 function loadCanonResearch(plan) {
@@ -1500,7 +1620,11 @@ async function retrieve(plan) {
                 contextEvidence: planned?.contextEvidence || '',
             };
         });
-        const batchQuery = `请在一次联网研究中逐个核实下列同人对象。上下文中的中文名只是候选名，可能是错译、误写或与别的角色混淆；必须先确认其实际所属作品和原文正式姓名，再整理档案。优先使用原作官网、出版社、官方角色页和可靠资料库，并交叉核对。回答中不要写网址、参考资料列表或引用编号。\n\n只输出合法 JSON：{"records":[{"candidateName":"必须原样回填输入候选名，仅用于配对","canonicalName":"核实后的简体中文正式名；可以且应当纠正候选名","originalName":"原文姓名（如日文汉字与假名）","workTitle":"实际所属原作，不得照抄错误的总作品名","aliases":["常见译名、原文名和本次错误候选名"],"verified":true,"summary":"必须以 canonicalName 开头；给正文模型使用的单人完整档案；紧凑无重复；只写确认事实；按适用情况包含身份、年龄、外貌身材、发色发型、典型穿着、性格与行为逻辑、能力、重要经历、人际关系、说话风格及不可违背的核心设定"}]}。不要限制档案长度；每个对象单独一条，绝不能把其他对象资料混入。若候选名错误但能根据作品线索、关系和上下文确认角色，必须返回纠正后的 canonicalName，不能照抄错误候选名。只有确认是用户原创人物或确实无法对应任何原作时才不返回该记录。\n\n研究对象（JSON）：\n${JSON.stringify(researchObjects)}\n\n检索问题：\n${plan.queries.map((query, index) => `${index + 1}. ${query}`).join('\n')}`;
+        const deltaOnly = plan.researchMode === 'official_delta';
+        const taskInstruction = deltaOnly
+            ? '这些对象已经有完整基础档案。本次只核实检索问题对应的新时间线节点或官方补充设定；不得重新总结姓名、外貌、性格、经历等既有基础档案。若没有任何相对已有档案的新增事实，records 必须返回空数组。summary 只写新增事实。'
+            : '这些是尚无档案的新对象。必须先确认其实际所属作品和原文正式姓名，再整理一次完整基础档案。';
+        const batchQuery = `请在一次联网研究中逐个核实下列同人对象。上下文中的中文名只是候选名，可能是错译、误写或与别的角色混淆。优先使用原作官网、出版社、官方角色页和可靠资料库，并交叉核对。回答中不要写网址、参考资料列表或引用编号。\n\n${taskInstruction}\n\n只输出合法 JSON：{"records":[{"candidateName":"必须原样回填输入候选名，仅用于配对","canonicalName":"核实后的简体中文正式名；可以且应当纠正候选名","originalName":"原文姓名（如日文汉字与假名）","workTitle":"实际所属原作，不得照抄错误的总作品名","aliases":["常见译名、原文名和本次错误候选名"],"verified":true,"summary":"${deltaOnly ? '只写本次新增官方事实' : '必须以 canonicalName 开头；给正文模型使用的单人完整档案；紧凑无重复；只写确认事实；按适用情况包含身份、年龄、外貌身材、发色发型、典型穿着、性格与行为逻辑、能力、重要经历、人际关系、说话风格及不可违背的核心设定'}"}]}。每个对象单独一条，绝不能把其他对象资料混入。若候选名错误但能根据作品线索、关系和上下文确认角色，必须返回纠正后的 canonicalName，不能照抄错误候选名。\n\n研究对象（JSON）：\n${JSON.stringify(researchObjects)}\n\n检索问题：\n${plan.queries.map((query, index) => `${index + 1}. ${query}`).join('\n')}`;
         jobs.push(searchWeb(batchQuery));
     }
     const settled = await Promise.allSettled(jobs);
@@ -1638,7 +1762,10 @@ function buildReference(plan, pages) {
     const nameCorrections = records.flatMap(record => recordAliases(record, record.entity)
         .filter(alias => canonicalEntityKey(alias) !== canonicalEntityKey(record.entity))
         .map(alias => `${alias} → ${record.entity}`));
-    const allCanonChanges = [...new Set([...(plan.canonChanges || []), ...persistedChanges].map(String).filter(Boolean))];
+    const pendingChanges = cleanCanonChanges(plan.canonChanges)
+        .filter(change => !persistedChanges.some(saved => changesAreEquivalent(change, saved)));
+    const allCanonChanges = [...persistedChanges, ...pendingChanges]
+        .filter((change, index, array) => !array.slice(0, index).some(saved => changesAreEquivalent(change, saved)));
     const canonChanges = allCanonChanges.length
         ? allCanonChanges.join('；')
         : '本轮没有检测到正文明确声明的新差异；已有角色继续沿用原著资料和既有AU设定';
@@ -1672,15 +1799,15 @@ async function runPreflight(chat, type = 'normal', force = false) {
         syncProfileFromPlan(plan);
         const storedPages = loadCanonResearch(plan);
         const missingEntities = missingCanonEntities(plan);
-        const hasExplicitChanges = Boolean(plan.timelineChanged || plan.canonChanges?.length);
-        const shouldFetch = force || missingEntities.length > 0 || hasExplicitChanges || storedPages.length === 0;
+        const locallyChangedEntities = await persistCanonDeltas(plan);
+        const shouldFetch = missingEntities.length > 0 || (plan.timelineChanged && plan.queries.length > 0);
         if (!plan.queries.length && !storedPages.length) {
             updateReport(`资料表已自动检查；没有新的有效检索对象（${elapsed()} 秒）`, plan);
             return;
         }
         updateReport(shouldFetch && plan.queries.length
-            ? `资料表已自动更新，正在批量检索…（${elapsed()} 秒）`
-            : `资料表已自动更新，正在读取本卡资料库…（${elapsed()} 秒）`, plan);
+            ? `检测到确实需要补充的新资料，正在增量检索…（${elapsed()} 秒）`
+            : `${locallyChangedEntities.length ? `已增量写入 ${locallyChangedEntities.length} 个角色的本卡变化；` : '角色资料没有变化，不搜索、不改写世界书；'}正在读取本卡资料库…（${elapsed()} 秒）`, plan);
         let fetchedPages = [];
         let timedOut = false;
         if (shouldFetch && plan.queries.length) {
@@ -1705,7 +1832,10 @@ async function runPreflight(chat, type = 'normal', force = false) {
         }
         const reference = buildReference(plan, pages).slice(0, 24000);
         setExtensionPrompt(PROMPT_KEY, reference, extension_prompt_types.IN_PROMPT, 0, false, extension_prompt_roles.SYSTEM);
-        updateReport(`${timedOut ? '新资料仍在后台检索；已先复用资料库并' : '已自动更新资料表并'}注入 ${pages.length} 条原作资料（总耗时 ${elapsed()} 秒）`, plan, pages);
+        const action = shouldFetch
+            ? (timedOut ? '增量资料仍在后台检索；已先复用资料库并' : '已完成必要的增量检索并')
+            : (locallyChangedEntities.length ? '已保存本卡新增变化并' : '未搜索、未改写世界书；已直接复用资料库并');
+        updateReport(`${action}注入 ${pages.length} 条原作资料（总耗时 ${elapsed()} 秒）`, plan, pages);
         console.info('[Fandom Canon] Reference injected.', { plan, pages });
     } catch (error) {
         console.error('[Fandom Canon] Retrieval failed.', error);
