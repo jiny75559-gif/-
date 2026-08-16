@@ -21,7 +21,8 @@ const QUICK_BUTTON_ID = 'fandom-canon-quick-button';
 const MENU_ENTRY_ID = 'fandom-canon-menu-entry';
 const LOCAL_CREDENTIAL_PREFIX = 'sillytavern-fandom-canon-retriever';
 const WORLD_ENTRY_PREFIX = '【同人原作资料库·插件自动维护】';
-const EXTENSION_VERSION = '2.3.1';
+const WORLD_ENTRY_MARKER = '·同人原作资料库·';
+const EXTENSION_VERSION = '2.3.2';
 const DEFAULTS = {
     enabled: true,
     language: 'zh',
@@ -1158,7 +1159,22 @@ function currentWorldBookName() {
 }
 
 function worldEntryComment(entity) {
-    return `${WORLD_ENTRY_PREFIX}${profileKey()}·${entity}`;
+    return `${entity}${WORLD_ENTRY_MARKER}${profileKey()}`;
+}
+
+// 兼容两种条目标题：旧版前缀式（【同人原作资料库·插件自动维护】卡·角色）与
+// 新版角色名在前式（角色·同人原作资料库·卡）。只认属于当前资料档案的条目。
+function parseWorldEntryComment(comment, expectedProfileKey) {
+    const text = String(comment || '');
+    if (text.startsWith(WORLD_ENTRY_PREFIX)) {
+        const rest = text.slice(WORLD_ENTRY_PREFIX.length);
+        return rest.startsWith(`${expectedProfileKey}·`) ? rest.slice(expectedProfileKey.length + 1) : '';
+    }
+    const markerIndex = text.indexOf(WORLD_ENTRY_MARKER);
+    if (markerIndex > 0 && text.slice(markerIndex + WORLD_ENTRY_MARKER.length) === expectedProfileKey) {
+        return text.slice(0, markerIndex);
+    }
+    return '';
 }
 
 function extractEntitySpecificText(value, entity, candidateEntities = []) {
@@ -1306,11 +1322,10 @@ async function sanitizePersistedProfiles() {
         if (!databaseChanged || !worldName) continue;
         const data = await loadWorldInfo(worldName);
         if (!data?.entries) continue;
-        const prefix = `${WORLD_ENTRY_PREFIX}${savedProfileKey}·`;
         let worldChanged = false;
         for (const [uid, entry] of Object.entries(data.entries)) {
-            if (!String(entry?.comment || '').startsWith(prefix)) continue;
-            const entity = String(entry.comment).slice(prefix.length);
+            const entity = parseWorldEntryComment(entry?.comment, savedProfileKey);
+            if (!entity) continue;
             const record = cardProfile.canonDatabase[entity];
             if (!record?.sources?.length) {
                 delete data.entries[uid];
@@ -1365,20 +1380,22 @@ async function syncCanonDatabaseToWorldBook(entities) {
     const databaseChanged = sanitizeCanonDatabase(database);
     const characterFile = String(currentCharacter()?.avatar || currentCharacter()?.name || '').replace(/\.[^.]+$/, '');
     let changed = false;
-    const prefix = `${WORLD_ENTRY_PREFIX}${profileKey()}·`;
+    const seenEntities = new Set();
     for (const [uid, entry] of Object.entries(data.entries)) {
-        if (!String(entry?.comment || '').startsWith(prefix)) continue;
-        const entity = String(entry.comment).slice(prefix.length);
-        if (cleanDetectedEntities([entity]).length && database[entity]?.sources?.length) continue;
+        const entity = parseWorldEntryComment(entry?.comment, profileKey());
+        if (!entity) continue;
+        const duplicate = seenEntities.has(entity);
+        seenEntities.add(entity);
+        if (!duplicate && cleanDetectedEntities([entity]).length && database[entity]?.sources?.length) continue;
         delete data.entries[uid];
-        delete database[entity];
+        if (!duplicate) delete database[entity];
         changed = true;
     }
     for (const entity of cleanDetectedEntities(entities)) {
         const record = database[entity];
         if (!record?.sources?.length) continue;
         const comment = worldEntryComment(entity);
-        let entry = Object.values(data.entries).find(item => item?.comment === comment);
+        let entry = Object.values(data.entries).find(item => parseWorldEntryComment(item?.comment, profileKey()) === entity);
         let isNew = false;
         if (!entry) {
             entry = createWorldInfoEntry(worldName, data);
@@ -1427,10 +1444,9 @@ async function clearCanonWorldBookEntries() {
     if (!worldName) return;
     const data = await loadWorldInfo(worldName);
     if (!data?.entries) return;
-    const prefix = `${WORLD_ENTRY_PREFIX}${profileKey()}·`;
     let changed = false;
     for (const [uid, entry] of Object.entries(data.entries)) {
-        if (String(entry?.comment || '').startsWith(prefix)) {
+        if (parseWorldEntryComment(entry?.comment, profileKey())) {
             delete data.entries[uid];
             changed = true;
         }
