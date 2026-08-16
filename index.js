@@ -5,6 +5,7 @@ import {
     getRequestHeaders,
     saveSettingsDebounced,
     setExtensionPrompt,
+    updateMessageBlock,
 } from '../../../../script.js';
 import { extension_settings } from '../../../extensions.js';
 import { getContext } from '../../../st-context.js';
@@ -20,13 +21,14 @@ const QUICK_BUTTON_ID = 'fandom-canon-quick-button';
 const MENU_ENTRY_ID = 'fandom-canon-menu-entry';
 const LOCAL_CREDENTIAL_PREFIX = 'sillytavern-fandom-canon-retriever';
 const WORLD_ENTRY_PREFIX = '【同人原作资料库·插件自动维护】';
-const EXTENSION_VERSION = '2.2.0';
+const EXTENSION_VERSION = '2.3.0';
 const DEFAULTS = {
     enabled: true,
     language: 'zh',
     autoPlanner: true,
     autoUpdateProfile: true,
     strictMode: true,
+    reviewEnabled: true,
     maxQueries: 3,
     pagesPerQuery: 2,
     cacheMinutes: 360,
@@ -1678,6 +1680,107 @@ async function ensureCanonProfiles(plan) {
     }
 }
 
+const REVIEW_SKIP_TYPES = new Set(['quiet', 'impersonate']);
+const reviewedMessageSignatures = new Set();
+
+function relevantCanonRecords(text, database = storedCanonEntities()) {
+    const body = String(text ?? '').toLowerCase();
+    if (!body) return [];
+    return Object.values(database).filter(record => {
+        if (!record?.sources?.length && !record?.profile) return false;
+        return recordAliases(record, record.entity).some(alias => body.includes(alias.toLowerCase()));
+    });
+}
+
+function reviewContextSummary(chat, messageId) {
+    return (Array.isArray(chat) ? chat.slice(0, messageId) : [])
+        .filter(message => message?.mes)
+        .slice(-6)
+        .map(message => `${message.is_user ? '用户' : (message.name || '角色')}：${stripMarkup(message.mes).slice(0, 500)}`)
+        .join('\n');
+}
+
+function buildReviewPrompt(body, records, recent) {
+    const cardProfile = profile();
+    const profiles = records.map(record => {
+        const text = String(record.profile || '').trim()
+            || (record.sources || []).map(source => source.extract).join('\n').slice(0, 1200);
+        const changes = Array.isArray(record.canonChanges) && record.canonChanges.length
+            ? record.canonChanges.join('；') : '';
+        return `【${record.entity}】（${record.work || '作品未确认'}）\n${text}${changes ? `\n已确认AU差异：${changes}` : ''}`;
+    }).join('\n\n');
+    return `你是同人正文的原作设定审核员。下面给你：①刚生成的正文；②参与本段剧情的原作角色档案（已按当前时间线过滤）；③此前剧情概要。请逐句核对正文与档案是否冲突，冲突范围包括：姓名译名、年龄身份、外貌（发色发型瞳色身材穿着）、性格与行为逻辑、能力、经历、人际关系、人物认知，以及当前时间线节点之后才应发生的事件。\n\n判定规则：角色卡设定、用户明确指示、档案中标注的已确认AU差异、以及此前剧情已明确建立或解释过的事实，一律视为有效设定，不是冲突，不得修订；只有正文与档案冲突、且上述依据都没有解释的情况才需要修订。拿不准的一律判通过；档案未写明的细节不算冲突。\n\n修订要求：只改冲突片段本身，保持原句式、语气、篇幅与剧情走向，不得增删无关内容；修正后的表述必须与档案一致。\n\n只输出 JSON：无冲突输出 {"verdict":"pass","revisions":[]}；有冲突输出 {"verdict":"conflict","revisions":[{"original":"逐字摘录正文中需要修改的连续片段","revised":"按档案修正后的片段","entity":"角色名","reason":"简短原因"}]}。original 必须逐字复制正文原文（保留星号等标记，不含省略号），否则无法应用。\n\n当前时间线/AU节点：${cardProfile.timeline || '未填写'}\n\n角色档案：\n${profiles}\n\n此前剧情概要：\n${recent || '无'}\n\n待审核正文：\n${body}`;
+}
+
+function applyTextRevisions(text, revisions) {
+    let updated = String(text ?? '');
+    const applied = [];
+    for (const revision of Array.isArray(revisions) ? revisions : []) {
+        const original = String(revision?.original ?? '').trim();
+        const revised = String(revision?.revised ?? '').trim();
+        if (!original || !revised || original === revised) continue;
+        if (!updated.includes(original)) continue;
+        updated = updated.replace(original, revised);
+        applied.push({
+            original,
+            revised,
+            entity: String(revision?.entity ?? '').trim(),
+            reason: String(revision?.reason ?? '').trim(),
+        });
+    }
+    return { updated, applied };
+}
+
+async function reviewGeneratedMessage(messageId, type) {
+    const config = settings();
+    if (!config.reviewEnabled || REVIEW_SKIP_TYPES.has(String(type ?? ''))) return;
+    const context = getContext();
+    const chat = Array.isArray(context.chat) ? context.chat : [];
+    const index = Number(messageId);
+    const message = chat[index];
+    if (!message || message.is_user || message.is_system) return;
+    const body = String(message.mes ?? '');
+    if (body.trim().length < 20) return;
+    const database = storedCanonEntities();
+    if (!Object.keys(database).length) return;
+    const recent = reviewContextSummary(chat, index);
+    const records = relevantCanonRecords(`${body}\n${recent}`, database).slice(0, 6);
+    if (!records.length) return;
+    const signature = `${index}:${textHash(body)}`;
+    if (reviewedMessageSignatures.has(signature)) return;
+    reviewedMessageSignatures.add(signature);
+    try {
+        updateReport(`正在按本卡原作资料审核刚生成的正文（涉及 ${records.map(record => record.entity).join('、')}）…`);
+        const parsed = await runJsonAnalysisPrompt(buildReviewPrompt(body.slice(0, 6000), records, recent), 2000);
+        const revisions = Array.isArray(parsed?.revisions) ? parsed.revisions : [];
+        if (parsed?.verdict !== 'conflict' || !revisions.length) {
+            updateReport('正文审核完成：与本卡原作资料没有需要修订的未解释冲突');
+            return;
+        }
+        const { updated, applied } = applyTextRevisions(message.mes, revisions);
+        if (!applied.length) {
+            updateReport(`审核发现 ${revisions.length} 处疑似冲突，但无法在正文中逐字定位，未自动修订`);
+            return;
+        }
+        message.mes = updated;
+        message.extra ??= {};
+        message.extra.fcr_revisions = applied;
+        if (Array.isArray(message.swipes) && Number.isInteger(message.swipe_id)) {
+            message.swipes[message.swipe_id] = updated;
+        }
+        await context.saveChat();
+        updateMessageBlock(index, message);
+        const reasons = [...new Set(applied
+            .map(item => `${item.entity || '角色'}：${item.reason || '与原作资料不符'}`))].join('；');
+        toastr.info(`已按原作资料自动修正 ${applied.length} 处冲突`, '晋阳的同人库');
+        updateReport(`已自动修正 ${applied.length} 处与原作资料的冲突（${reasons.slice(0, 300)}）`);
+        console.info('[Fandom Canon] Auto-revised canon conflicts.', applied);
+    } catch (error) {
+        console.warn('[Fandom Canon] Post-generation review failed.', error);
+        updateReport(`正文审核失败（不影响已生成内容）：${error?.message || error}`);
+    }
+}
+
 async function retrieve(plan) {
     const config = settings();
     const cardProfile = profile();
@@ -1990,7 +2093,8 @@ function panelHtml() {
                 <button id="fcr-enabled" class="fcr-check-row" type="button" aria-pressed="${config.enabled}"><span class="fcr-check-box" aria-hidden="true"></span><span>生成前自动核实原作资料</span></button>
                 <button id="fcr-planner" class="fcr-check-row" type="button" aria-pressed="${config.autoPlanner}"><span class="fcr-check-box" aria-hidden="true"></span><span>让分析模型规划本轮检索词（会多一次短请求）</span></button>
                 <button id="fcr-auto-update-profile" class="fcr-check-row" type="button" aria-pressed="${config.autoUpdateProfile}"><span class="fcr-check-box" aria-hidden="true"></span><span>随剧情自动更新作品、时间线和当前人物表</span></button>
-                <button id="fcr-strict" class="fcr-check-row" type="button" aria-pressed="${config.strictMode}"><span class="fcr-check-box" aria-hidden="true"></span><span>严格模式：没有资料依据时不编造精确设定</span></button>
+                    <button id="fcr-strict" class="fcr-check-row" type="button" aria-pressed="${config.strictMode}"><span class="fcr-check-box" aria-hidden="true"></span><span>严格模式：没有资料依据时不编造精确设定</span></button>
+                    <button id="fcr-review" class="fcr-check-row" type="button" aria-pressed="${config.reviewEnabled}"><span class="fcr-check-box" aria-hidden="true"></span><span>生成后自动审核正文，按本卡资料修订未解释的冲突（性格/经历/外貌/能力等）</span></button>
                 <div class="fcr-grid">
                     <label>Wikipedia 语言<select id="fcr-language"><option value="zh">中文</option><option value="ja">日文</option><option value="en">英文</option></select></label>
                     <label>每次最多查询数<input id="fcr-max-queries" type="number" min="1" max="5" value="${config.maxQueries}"></label>
@@ -2196,6 +2300,7 @@ function bindPanel() {
     bindToggle('#fcr-planner', 'autoPlanner');
     bindToggle('#fcr-auto-update-profile', 'autoUpdateProfile');
     bindToggle('#fcr-strict', 'strictMode');
+    bindToggle('#fcr-review', 'reviewEnabled');
 
     bindSetting('#fcr-language', 'language', String);
     bindSetting('#fcr-max-queries', 'maxQueries', value => clampInt(value, 1, 5, 3));
@@ -2381,10 +2486,15 @@ function initialize() {
     context.eventSource?.on?.(context.eventTypes?.CHAT_CHANGED ?? 'chat_changed', () => setTimeout(() => {
         lastRunSignature = '';
         lastReferenceText = '';
+        reviewedMessageSignatures.clear();
         loadProfileIntoPanel();
         refreshOrMigrateCanonDatabase()
             .catch(error => console.error('[Fandom Canon] Could not refresh canon database.', error));
     }, 150));
+    context.eventSource?.on?.(context.eventTypes?.MESSAGE_RECEIVED ?? 'message_received', (messageId, type) => {
+        reviewGeneratedMessage(messageId, type)
+            .catch(error => console.error('[Fandom Canon] Could not review generated message.', error));
+    });
     console.info('[Fandom Canon] Loaded.');
 }
 
