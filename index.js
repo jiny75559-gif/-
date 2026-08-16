@@ -21,7 +21,7 @@ const QUICK_BUTTON_ID = 'fandom-canon-quick-button';
 const MENU_ENTRY_ID = 'fandom-canon-menu-entry';
 const LOCAL_CREDENTIAL_PREFIX = 'sillytavern-fandom-canon-retriever';
 const WORLD_ENTRY_PREFIX = '【同人原作资料库·插件自动维护】';
-const EXTENSION_VERSION = '2.3.0';
+const EXTENSION_VERSION = '2.3.1';
 const DEFAULTS = {
     enabled: true,
     language: 'zh',
@@ -104,6 +104,9 @@ function apiEndpoint(baseUrl, path) {
     return `${String(baseUrl).replace(/\/$/, '')}/${String(path).replace(/^\//, '')}`;
 }
 
+// 分析/搜索 LLM 请求的兜底超时：防止中转挂起导致规划阶段永久卡住 busy。
+const LLM_FETCH_TIMEOUT_MS = 150000;
+
 async function directApiFetch(url, options, label) {
     try {
         const response = await fetch(url, options);
@@ -113,6 +116,9 @@ async function directApiFetch(url, options, label) {
         }
         return response;
     } catch (error) {
+        if (error?.name === 'AbortError' || error?.name === 'TimeoutError') {
+            throw new Error(`${label}超时：服务器长时间无响应`);
+        }
         if (error instanceof TypeError) {
             throw new Error(`${label}无法从浏览器直连。请确认 API 使用 HTTPS，并允许浏览器跨域访问（CORS）；此插件不会要求修改酒馆服务器源码。`);
         }
@@ -160,12 +166,14 @@ async function chatCompletionWithFallback(baseUrl, kind, body, label) {
             method: 'POST',
             headers: directApiHeaders(kind),
             body: JSON.stringify(body),
+            signal: AbortSignal.timeout(LLM_FETCH_TIMEOUT_MS),
         }, label);
         return await response.json();
     } catch (directError) {
         const response = await fetch('/api/backends/chat-completions/generate', {
             method: 'POST',
             headers: getRequestHeaders(),
+            signal: AbortSignal.timeout(LLM_FETCH_TIMEOUT_MS),
             body: JSON.stringify({
                 chat_completion_source: 'custom',
                 custom_url: baseUrl,
@@ -909,7 +917,8 @@ async function searchWiki(apiUrl, query, sourceName) {
         prop: 'extracts|info',
         explaintext: '1',
         exintro: '1',
-        exchars: String(config.maxPageChars),
+        exchars: String(Math.min(1200, config.maxPageChars)),
+        exlimit: String(Math.min(20, config.pagesPerQuery)),
         inprop: 'url',
         redirects: '1',
         format: 'json',
@@ -1001,6 +1010,7 @@ async function callCustomSearchAi(query) {
         method: 'POST',
         headers: directApiHeaders('search-ai'),
         body: JSON.stringify(body),
+        signal: AbortSignal.timeout(180000),
     }, '搜索 AI Responses 请求');
     return unpackSearchAiResponse(await response.json(), config.searchAiModel);
 }
@@ -1720,7 +1730,7 @@ function applyTextRevisions(text, revisions) {
         const revised = String(revision?.revised ?? '').trim();
         if (!original || !revised || original === revised) continue;
         if (!updated.includes(original)) continue;
-        updated = updated.replace(original, revised);
+        updated = updated.replace(original, () => revised);
         applied.push({
             original,
             revised,
@@ -1751,10 +1761,14 @@ async function reviewGeneratedMessage(messageId, type) {
     reviewedMessageSignatures.add(signature);
     try {
         updateReport(`正在按本卡原作资料审核刚生成的正文（涉及 ${records.map(record => record.entity).join('、')}）…`);
-        const parsed = await runJsonAnalysisPrompt(buildReviewPrompt(body.slice(0, 6000), records, recent), 2000);
+        const parsed = await runJsonAnalysisPrompt(buildReviewPrompt(body.slice(0, 8000), records, recent), 2000);
         const revisions = Array.isArray(parsed?.revisions) ? parsed.revisions : [];
         if (parsed?.verdict !== 'conflict' || !revisions.length) {
             updateReport('正文审核完成：与本卡原作资料没有需要修订的未解释冲突');
+            return;
+        }
+        if (chat[index] !== message || textHash(String(message.mes ?? '')) !== textHash(body)) {
+            updateReport('正文在审核期间被修改或删除，已放弃自动修订');
             return;
         }
         const { updated, applied } = applyTextRevisions(message.mes, revisions);
@@ -1764,6 +1778,7 @@ async function reviewGeneratedMessage(messageId, type) {
         }
         message.mes = updated;
         message.extra ??= {};
+        if (typeof message.extra.display_text === 'string') message.extra.display_text = updated;
         message.extra.fcr_revisions = applied;
         if (Array.isArray(message.swipes) && Number.isInteger(message.swipe_id)) {
             message.swipes[message.swipe_id] = updated;
@@ -1994,6 +2009,7 @@ function conversationSignature(chat) {
         cardProfile.workTitle,
         cardProfile.timeline,
         cardProfile.entities,
+        settings().strictMode,
     ].join('|');
 }
 
@@ -2093,8 +2109,8 @@ function panelHtml() {
                 <button id="fcr-enabled" class="fcr-check-row" type="button" aria-pressed="${config.enabled}"><span class="fcr-check-box" aria-hidden="true"></span><span>生成前自动核实原作资料</span></button>
                 <button id="fcr-planner" class="fcr-check-row" type="button" aria-pressed="${config.autoPlanner}"><span class="fcr-check-box" aria-hidden="true"></span><span>让分析模型规划本轮检索词（会多一次短请求）</span></button>
                 <button id="fcr-auto-update-profile" class="fcr-check-row" type="button" aria-pressed="${config.autoUpdateProfile}"><span class="fcr-check-box" aria-hidden="true"></span><span>随剧情自动更新作品、时间线和当前人物表</span></button>
-                    <button id="fcr-strict" class="fcr-check-row" type="button" aria-pressed="${config.strictMode}"><span class="fcr-check-box" aria-hidden="true"></span><span>严格模式：没有资料依据时不编造精确设定</span></button>
-                    <button id="fcr-review" class="fcr-check-row" type="button" aria-pressed="${config.reviewEnabled}"><span class="fcr-check-box" aria-hidden="true"></span><span>生成后自动审核正文，按本卡资料修订未解释的冲突（性格/经历/外貌/能力等）</span></button>
+                <button id="fcr-strict" class="fcr-check-row" type="button" aria-pressed="${config.strictMode}"><span class="fcr-check-box" aria-hidden="true"></span><span>严格模式：没有资料依据时不编造精确设定</span></button>
+                <button id="fcr-review" class="fcr-check-row" type="button" aria-pressed="${config.reviewEnabled}"><span class="fcr-check-box" aria-hidden="true"></span><span>生成后自动审核正文，按本卡资料修订未解释的冲突（性格/经历/外貌/能力等）</span></button>
                 <div class="fcr-grid">
                     <label>Wikipedia 语言<select id="fcr-language"><option value="zh">中文</option><option value="ja">日文</option><option value="en">英文</option></select></label>
                     <label>每次最多查询数<input id="fcr-max-queries" type="number" min="1" max="5" value="${config.maxQueries}"></label>
