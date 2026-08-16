@@ -20,7 +20,7 @@ const QUICK_BUTTON_ID = 'fandom-canon-quick-button';
 const MENU_ENTRY_ID = 'fandom-canon-menu-entry';
 const LOCAL_CREDENTIAL_PREFIX = 'sillytavern-fandom-canon-retriever';
 const WORLD_ENTRY_PREFIX = '【同人原作资料库·插件自动维护】';
-const EXTENSION_VERSION = '2.1.7';
+const EXTENSION_VERSION = '2.2.0';
 const DEFAULTS = {
     enabled: true,
     language: 'zh',
@@ -31,6 +31,7 @@ const DEFAULTS = {
     pagesPerQuery: 2,
     cacheMinutes: 360,
     searchWaitSeconds: 15,
+    newEntityWaitSeconds: 60,
     maxPageChars: 2600,
     searchProvider: 'wiki',
     searxngUrl: '',
@@ -49,6 +50,8 @@ const DEFAULTS = {
 
 let busy = false;
 let lastReport = { status: '尚未检索', queries: [], sources: [], at: 0 };
+let lastRunSignature = '';
+let lastReferenceText = '';
 const inFlightResearch = new Map();
 
 function settings() {
@@ -435,7 +438,6 @@ async function callCustomAnalysis(baseUrl, model, prompt, maxTokens = 500) {
             messages: [{ role: 'user', content: prompt }],
             temperature: 0.1,
             max_tokens: tokenBudget,
-            max_completion_tokens: tokenBudget,
             stream: false,
         }, '分析 LLM 请求');
         const content = extractAssistantContent(data).trim();
@@ -1323,8 +1325,9 @@ function formatCanonWorldEntry(record) {
         .replace(/\*\*/g, '')
         .replace(/\n{3,}/g, '\n\n')
         .trim();
+    const profileText = String(record.profile || '').trim();
     const seen = new Set();
-    const extracts = (record.sources || [])
+    const extracts = profileText || (record.sources || [])
         .map(source => extractEntitySpecificText(source.extract, record.entity))
         .map(cleanSummary)
         .filter(text => text && !/^这是搜索 AI 在本轮检索中选择/.test(text))
@@ -1504,8 +1507,11 @@ async function saveCanonResearch(plan, pages) {
             ...page,
             title: page.source === '自定义搜索 AI' ? canonicalName : page.title,
             extract: extractEntitySpecificText(page.extract, canonicalName, [...planEntities, ...aliases]),
-        })).filter(page => page.extract && ([page.title, page.extract]
-            .some(value => aliases.some(alias => String(value ?? '').toLowerCase().includes(alias.toLowerCase())))))
+        })).filter(page => page.extract && ([
+            page.title,
+            page.extract,
+            page.query,
+        ].some(value => aliases.some(alias => String(value ?? '').toLowerCase().includes(alias.toLowerCase())))))
             .filter(page => !previousSources.some(source => changesAreEquivalent(page.extract, source.extract)));
         if (!relevant.length && !previous?.sources?.length) continue;
         const mergedSources = [...previousSources, ...relevant]
@@ -1523,6 +1529,8 @@ async function saveCanonResearch(plan, pages) {
             aliases,
             work: canonicalPage?.workTitle || previous?.work || plan.work || '',
             timeline: plan.timeline || previous?.timeline || '',
+            profile: previous?.profile || '',
+            profileHash: previous?.profileHash || '',
             updatedAt: previous?.updatedAt || Date.now(),
             canonChanges: [...new Set([
                 ...(Array.isArray(previous?.canonChanges) ? previous.canonChanges : []),
@@ -1586,6 +1594,88 @@ function missingCanonEntities(plan) {
         const recordName = findCanonRecordName(entity, database);
         return !recordName || !database[recordName]?.sources?.length;
     });
+}
+
+function textHash(value) {
+    const text = String(value ?? '');
+    let hash = 5381;
+    for (let index = 0; index < text.length; index++) {
+        hash = ((hash << 5) + hash + text.charCodeAt(index)) | 0;
+    }
+    return `${text.length}:${(hash >>> 0).toString(36)}`;
+}
+
+function canonProfileHash(record) {
+    return textHash(JSON.stringify({
+        timeline: String(record?.timeline || ''),
+        changes: Array.isArray(record?.canonChanges) ? record.canonChanges : [],
+        sources: (Array.isArray(record?.sources) ? record.sources : [])
+            .map(source => `${source?.title || ''}|${source?.extract || ''}`),
+    }));
+}
+
+const PROFILE_RETRY_MINUTES = 10;
+
+async function ensureCanonProfiles(plan) {
+    const database = storedCanonEntities();
+    const pending = [];
+    for (const entity of cleanDetectedEntities(plan.entities)) {
+        const recordName = findCanonRecordName(entity, database);
+        const record = database[recordName];
+        if (!record?.sources?.length) continue;
+        const hash = canonProfileHash(record);
+        if (record.profile && record.profileHash === hash) continue;
+        if (!record.profile && record.profileHash === hash
+            && Date.now() - (record.profileAttemptedAt || 0) < PROFILE_RETRY_MINUTES * 60 * 1000) continue;
+        pending.push({ record, hash });
+    }
+    if (!pending.length) return [];
+
+    const limited = pending.slice(0, 8);
+    const tasks = limited.map(({ record }) => ({
+        name: record.entity,
+        work: record.work || plan.work || '',
+        timeline: record.timeline || plan.timeline || '',
+        auChanges: Array.isArray(record.canonChanges) ? record.canonChanges : [],
+    }));
+    const materialSections = limited.map(({ record }) => `【${record.entity}】\n${(record.sources || [])
+        .map(source => `${source.title}：${source.extract}`)
+        .join('\n')
+        .slice(0, 2800)}`);
+    const prompt = `你是原作设定编辑，负责把检索到的原始资料压缩成正文模型直接可用的角色档案。只能使用资料中明确写出的事实，禁止补充资料之外的原作剧情。对每个对象输出一份 150-400 字的紧凑档案：以正式名开头；按资料覆盖情况涵盖身份、年龄、外貌身材与发型发色、典型穿着、性格与行为逻辑、能力、经历、人际关系、说话风格；已确认AU差异写成“本卡AU：…”。时间线过滤规则：当前时间线节点之后才发生的经历、关系变化、能力觉醒、身份揭露、伤亡与秘密一律不得写入；时间线标注为“用户原创世界”类时只保留身份、外貌、性格等固有设定，不写任何原作剧情经历。不写来源、网址或引用编号。\n\n对象（JSON）：\n${JSON.stringify(tasks)}\n\n各对象原始资料：\n${materialSections.join('\n\n')}\n\n只输出 JSON：{"profiles":{"正式名":"档案文本"}}，profiles 的键必须原样使用每个对象的 name。`;
+
+    try {
+        updateReport('分析模型正在按当前时间线压缩角色档案…');
+        const parsed = await runJsonAnalysisPrompt(prompt, 4200);
+        const profiles = parsed && typeof parsed.profiles === 'object' ? parsed.profiles : {};
+        const byKey = new Map(Object.entries(profiles)
+            .map(([key, value]) => [canonicalEntityKey(key), String(value ?? '').trim()]));
+        const updated = [];
+        for (const { record, hash } of limited) {
+            const text = byKey.get(canonicalEntityKey(record.entity)) || '';
+            if (text.length >= 40) {
+                record.profile = text.slice(0, 1500);
+                record.profileHash = hash;
+                updated.push(record.entity);
+            }
+        }
+        if (updated.length) {
+            saveSettingsDebounced();
+            await syncCanonDatabaseToWorldBook(updated);
+        }
+        return updated;
+    } catch (error) {
+        console.warn('[Fandom Canon] Profile compression failed; falling back to raw extracts.', error);
+        const attemptedAt = Date.now();
+        for (const { record, hash } of limited) {
+            if (!record.profile) {
+                record.profileHash = hash;
+                record.profileAttemptedAt = attemptedAt;
+            }
+        }
+        saveSettingsDebounced();
+        return [];
+    }
 }
 
 async function retrieve(plan) {
@@ -1662,7 +1752,7 @@ function startCanonEnrichment(plan) {
 }
 
 async function waitForResearch(job, seconds) {
-    const waitMs = clampInt(seconds, 0, 60, 15) * 1000;
+    const waitMs = clampInt(seconds, 0, 180, 15) * 1000;
     if (waitMs <= 0) return { timedOut: true, pages: [] };
     let timer;
     try {
@@ -1702,7 +1792,10 @@ async function autoFillCurrentProfile() {
             : String(first.timeline || cardProfile.timeline || '').trim();
         const entities = cleanDetectedEntities(first.entities).slice(0, 8);
         const database = storedCanonEntities();
-        const missingEntities = entities.filter(entity => !database[entity]?.sources?.length);
+        const missingEntities = entities.filter(entity => {
+            const recordName = findCanonRecordName(entity, database);
+            return !recordName || !database[recordName]?.sources?.length;
+        });
         let queries = missingEntities.map(entity =>
             `${entity} ${workTitle} 原作完整角色档案：身份、年龄、外貌身材、典型穿着、性格行为逻辑、能力、重要经历、人际关系、说话风格`.trim());
         queries = cleanPlannedQueries(queries, workTitle).slice(0, settings().maxQueries);
@@ -1736,9 +1829,10 @@ async function autoFillCurrentProfile() {
         toastr.success(`已写入：${filled.join('、')}。${needsResearch ? '原作资料会在后台继续补入世界书。' : ''}`, '晋阳的同人库');
         if (needsResearch) {
             const backgroundStartedAt = performance.now();
-            startCanonEnrichment(provisional).then(pages => {
+            startCanonEnrichment(provisional).then(async pages => {
                 const searchSeconds = secondsSince(backgroundStartedAt);
-                updateReport(`后台检索完成：已保存 ${pages.length} 条资料到本卡资料库/世界书（${searchSeconds} 秒）`, provisional, pages);
+                await ensureCanonProfiles(provisional);
+                updateReport(`后台检索完成：已保存 ${pages.length} 条资料并压缩为时间线内档案（${searchSeconds} 秒）`, provisional, pages);
             }).catch(error => updateReport(`表格已填写，但后台检索失败：${error?.message || error}`, provisional));
         }
     } catch (error) {
@@ -1748,11 +1842,8 @@ async function autoFillCurrentProfile() {
     }
 }
 
-function buildReference(plan, pages) {
+function buildReference(plan) {
     const strict = settings().strictMode;
-    const sources = pages.map((page, index) =>
-        `[资料 ${index + 1}] ${page.source}｜${page.title}${page.url ? `｜${page.url}` : ''}\n${page.extract}`,
-    ).join('\n\n');
     const database = storedCanonEntities();
     const records = cleanDetectedEntities(plan.entities)
         .map(entity => database[findCanonRecordName(entity, database)])
@@ -1769,7 +1860,14 @@ function buildReference(plan, pages) {
     const canonChanges = allCanonChanges.length
         ? allCanonChanges.join('；')
         : '本轮没有检测到正文明确声明的新差异；已有角色继续沿用原著资料和既有AU设定';
-    return `<fandom_canon_reference>\n作品：${plan.work || '未确认'}\n当前时间线/AU节点：${plan.timeline || '未确认；必须避免擅自假定具体集数或时期'}\n本轮核实对象：${plan.entities.join('、') || '由上下文判断'}\n姓名校正：${nameCorrections.length ? [...new Set(nameCorrections)].join('；') : '无'}\n本轮明确的原著差异：${canonChanges}\n\n${sources}\n\n写作约束：\n1. 正文动笔前先依据上述资料核对姓名、外貌、身材、发色发型、惯常服装、性格、能力、经历和人际关系；候选名与资料冲突时必须使用“姓名校正”后的正式名，不得沿用错误译名。\n2. 角色卡、用户明确设定和本次 AU 高于原作；除此之外保持原作一致。\n3. 严守当前时间线：此节点之后才发生的事件、关系变化、伤亡、能力、秘密和人物认知不得提前出现。\n4. 资料只证明其中明确写出的事实；搜索摘要缺失不代表不存在。${strict ? '没有证据的精确原作事实不得编造，必要时采用不冲突的模糊描写。' : ''}\n5. 不要在正文提及检索、Wiki、资料编号或这些规则，直接自然写作。\n</fandom_canon_reference>`;
+    const profiles = records.map(record => {
+        const body = String(record.profile || '').trim()
+            || (record.sources || [])
+                .map(source => extractEntitySpecificText(source.extract, record.entity))
+                .filter(Boolean).join('\n').slice(0, 1200);
+        return body ? `【${record.entity}】（${record.work || plan.work || '作品未确认'}）\n${body}` : '';
+    }).filter(Boolean);
+    return `<fandom_canon_reference>\n作品：${plan.work || '未确认'}\n当前时间线/AU节点：${plan.timeline || '未确认；必须避免擅自假定具体集数或时期'}\n本轮核实对象：${plan.entities.join('、') || '由上下文判断'}\n姓名校正：${nameCorrections.length ? [...new Set(nameCorrections)].join('；') : '无'}\n本轮明确的原著差异：${canonChanges}\n\n${profiles.length ? `角色档案（已按当前时间线过滤，节点之后的剧情不得出现）：\n\n${profiles.join('\n\n')}\n\n` : ''}写作约束：\n1. 正文动笔前先依据上述档案核对姓名、外貌、身材、发色发型、惯常服装、性格、能力、经历和人际关系；候选名与资料冲突时必须使用“姓名校正”后的正式名，不得沿用错误译名。\n2. 角色卡、用户明确设定和本次 AU 高于原作；除此之外保持原作一致。\n3. 严守当前时间线：档案未提及的后期事件、关系变化、伤亡、能力、秘密和人物认知一律当作尚未发生，不得提前出现或暗示。\n4. 档案只证明其中明确写出的事实；资料没写不代表不存在。${strict ? '没有证据的精确原作事实不得编造，必要时采用不冲突的模糊描写。' : ''}\n5. 不要在正文提及检索、Wiki、资料编号或这些规则，直接自然写作。\n</fandom_canon_reference>`.slice(0, 16000);
 }
 
 function updateReport(status, plan = null, pages = []) {
@@ -1782,11 +1880,36 @@ function updateReport(status, plan = null, pages = []) {
     renderReport();
 }
 
+function conversationSignature(chat) {
+    const messages = Array.isArray(chat) ? chat : [];
+    const lastUserMessage = [...messages].reverse().find(message => message?.is_user);
+    const cardProfile = profile();
+    return [
+        profileKey(),
+        messages.filter(message => message?.is_user).length,
+        lastUserMessage?.send_date ?? '',
+        cardProfile.workTitle,
+        cardProfile.timeline,
+        cardProfile.entities,
+    ].join('|');
+}
+
 async function runPreflight(chat, type = 'normal', force = false) {
     const startedAt = performance.now();
     const elapsed = () => ((performance.now() - startedAt) / 1000).toFixed(1);
+    if (busy) return;
     setExtensionPrompt(PROMPT_KEY, '', extension_prompt_types.IN_PROMPT, 0, false, extension_prompt_roles.SYSTEM);
-    if ((!settings().enabled && !force) || type === 'quiet' || busy) return;
+    if (type === 'quiet' || (!settings().enabled && !force)) return;
+    const signature = conversationSignature(chat);
+    if (!force && signature && signature === lastRunSignature) {
+        if (lastReferenceText) {
+            setExtensionPrompt(PROMPT_KEY, lastReferenceText, extension_prompt_types.IN_PROMPT, 0, false, extension_prompt_roles.SYSTEM);
+            updateReport('对话尚未推进，已沿用上轮核实并注入的原作资料');
+        } else {
+            updateReport('对话尚未推进；上轮已确认无需新增检索');
+        }
+        return;
+    }
     if (!profile().workTitle.trim() && !profile().entities.trim() && !currentCharacter()?.name) {
         updateReport('缺少作品名或人物名，已跳过');
         return;
@@ -1803,6 +1926,7 @@ async function runPreflight(chat, type = 'normal', force = false) {
         const shouldFetch = missingEntities.length > 0 || (plan.timelineChanged && plan.queries.length > 0);
         if (!plan.queries.length && !storedPages.length) {
             updateReport(`资料表已自动检查；没有新的有效检索对象（${elapsed()} 秒）`, plan);
+            lastRunSignature = signature;
             return;
         }
         updateReport(shouldFetch && plan.queries.length
@@ -1812,8 +1936,10 @@ async function runPreflight(chat, type = 'normal', force = false) {
         let timedOut = false;
         if (shouldFetch && plan.queries.length) {
             if (missingEntities.length) {
-                updateReport(`检测到新原作对象：${missingEntities.join('、')}；正在先核对正式姓名与完整档案，完成后才进入正文（${elapsed()} 秒）`, plan);
-                fetchedPages = await startCanonEnrichment(plan);
+                updateReport(`检测到新原作对象：${missingEntities.join('、')}；正在核对正式姓名与完整档案，最多等待 ${settings().newEntityWaitSeconds} 秒，超时转入后台下轮补全（${elapsed()} 秒）`, plan);
+                const result = await waitForResearch(startCanonEnrichment(plan), settings().newEntityWaitSeconds);
+                fetchedPages = result.pages;
+                timedOut = result.timedOut;
             } else {
                 const result = await waitForResearch(startCanonEnrichment(plan), settings().searchWaitSeconds);
                 fetchedPages = result.pages;
@@ -1826,19 +1952,24 @@ async function runPreflight(chat, type = 'normal', force = false) {
         ).slice(0, 10);
         if (!pages.length) {
             updateReport(timedOut
-                ? `时间线增量检索超过 ${settings().searchWaitSeconds} 秒，已转入后台；本轮沿用现有资料（${elapsed()} 秒）`
+                ? `增量检索超过等待上限，已转入后台；本轮沿用现有资料（${elapsed()} 秒）`
                 : `没有取得可用资料；本轮仅按角色卡与上下文继续，不会把候选译名当成已核实正式名（${elapsed()} 秒）`, plan);
+            if (!timedOut) lastRunSignature = signature;
             return;
         }
-        const reference = buildReference(plan, pages).slice(0, 24000);
+        await ensureCanonProfiles(plan);
+        const reference = buildReference(plan);
         setExtensionPrompt(PROMPT_KEY, reference, extension_prompt_types.IN_PROMPT, 0, false, extension_prompt_roles.SYSTEM);
+        lastReferenceText = reference;
         const action = shouldFetch
             ? (timedOut ? '增量资料仍在后台检索；已先复用资料库并' : '已完成必要的增量检索并')
             : (locallyChangedEntities.length ? '已保存本卡新增变化并' : '未搜索、未改写世界书；已直接复用资料库并');
-        updateReport(`${action}注入 ${pages.length} 条原作资料（总耗时 ${elapsed()} 秒）`, plan, pages);
+        updateReport(`${action}注入 ${pages.length} 条资料的整理档案（总耗时 ${elapsed()} 秒）`, plan, pages);
         console.info('[Fandom Canon] Reference injected.', { plan, pages });
+        if (!timedOut) lastRunSignature = signature;
     } catch (error) {
         console.error('[Fandom Canon] Retrieval failed.', error);
+        lastRunSignature = '';
         updateReport(`检索失败：${error?.message || error}`);
     } finally {
         busy = false;
@@ -1865,6 +1996,7 @@ function panelHtml() {
                     <label>每次最多查询数<input id="fcr-max-queries" type="number" min="1" max="5" value="${config.maxQueries}"></label>
                     <label>缓存分钟<input id="fcr-cache-minutes" type="number" min="10" max="10080" value="${config.cacheMinutes}"></label>
                     <label>已有资料增量检索最多等待（秒）<input id="fcr-search-wait" type="number" min="0" max="60" value="${config.searchWaitSeconds}"></label>
+                    <label>新角色完整检索最多等待（秒）<input id="fcr-new-entity-wait" type="number" min="0" max="180" value="${config.newEntityWaitSeconds}"></label>
                 </div>
                 <details class="fcr-api-box" open>
                     <summary><i class="fa-solid fa-globe"></i> 搜索 API 配置</summary>
@@ -2069,6 +2201,7 @@ function bindPanel() {
     bindSetting('#fcr-max-queries', 'maxQueries', value => clampInt(value, 1, 5, 3));
     bindSetting('#fcr-cache-minutes', 'cacheMinutes', value => clampInt(value, 10, 10080, 360));
     bindSetting('#fcr-search-wait', 'searchWaitSeconds', value => clampInt(value, 0, 60, 15));
+    bindSetting('#fcr-new-entity-wait', 'newEntityWaitSeconds', value => clampInt(value, 0, 180, 60));
     bindSetting('#fcr-search-provider', 'searchProvider', String);
     bindSetting('#fcr-searxng-url', 'searxngUrl', String);
     bindSetting('#fcr-source-strategy', 'sourceStrategy', String);
@@ -2133,6 +2266,8 @@ function bindPanel() {
     });
     $('#fcr-clear-database').on('click', async () => {
         profile().canonDatabase = {};
+        lastRunSignature = '';
+        lastReferenceText = '';
         await clearCanonWorldBookEntries();
         saveSettingsDebounced();
         updateReport('当前角色卡的持久资料库及插件世界书条目已清空；下次生成会重新检索');
@@ -2244,6 +2379,8 @@ function initialize() {
     setTimeout(() => clearInterval(entryTimer), 15000);
     const context = getContext();
     context.eventSource?.on?.(context.eventTypes?.CHAT_CHANGED ?? 'chat_changed', () => setTimeout(() => {
+        lastRunSignature = '';
+        lastReferenceText = '';
         loadProfileIntoPanel();
         refreshOrMigrateCanonDatabase()
             .catch(error => console.error('[Fandom Canon] Could not refresh canon database.', error));
