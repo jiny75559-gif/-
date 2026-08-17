@@ -22,7 +22,7 @@ const MENU_ENTRY_ID = 'fandom-canon-menu-entry';
 const LOCAL_CREDENTIAL_PREFIX = 'sillytavern-fandom-canon-retriever';
 const WORLD_ENTRY_PREFIX = '【同人原作资料库·插件自动维护】';
 const WORLD_ENTRY_MARKER = '·同人原作资料库·';
-const EXTENSION_VERSION = '2.3.2';
+const EXTENSION_VERSION = '2.3.5';
 const DEFAULTS = {
     enabled: true,
     language: 'zh',
@@ -55,6 +55,8 @@ let busy = false;
 let lastReport = { status: '尚未检索', queries: [], sources: [], at: 0 };
 let lastRunSignature = '';
 let lastReferenceText = '';
+let conversationTransition = null;
+const scopeEpochs = new Map();
 const inFlightResearch = new Map();
 
 function settings() {
@@ -242,6 +244,10 @@ function profileKey() {
     return String(character?.avatar || character?.name || (getContext().characterId ?? 'global'));
 }
 
+function currentConversationId() {
+    return String(getContext().chatId || '').trim();
+}
+
 function profile() {
     const all = settings().profiles;
     const key = profileKey();
@@ -258,6 +264,71 @@ function profile() {
     cardProfile.lastAutoTimeline ??= cardProfile.timeline || '';
     cardProfile.lastAutoEntities ??= manualEntities(cardProfile.entities || '');
     return cardProfile;
+}
+
+function scopeIdentity(targetProfileKey = profileKey(), targetConversationId = currentConversationId()) {
+    return `${targetProfileKey}\u0000${targetConversationId}`;
+}
+
+function clearRuntimeState(targetProfileKey = profileKey(), targetConversationId = currentConversationId()) {
+    const targetScope = scopeIdentity(targetProfileKey, targetConversationId);
+    scopeEpochs.set(targetScope, (scopeEpochs.get(targetScope) || 0) + 1);
+    busy = false;
+    lastRunSignature = '';
+    lastReferenceText = '';
+    for (const key of inFlightResearch.keys()) {
+        if (key.startsWith(`${targetScope}|`)) inFlightResearch.delete(key);
+    }
+    for (const signature of reviewedMessageSignatures) {
+        if (signature.startsWith(`${targetScope}|`)) reviewedMessageSignatures.delete(signature);
+    }
+    setExtensionPrompt(PROMPT_KEY, '', extension_prompt_types.IN_PROMPT, 0, false, extension_prompt_roles.SYSTEM);
+}
+
+function clearConversationProfile(cardProfile, conversationId = currentConversationId()) {
+    cardProfile.workTitle = '';
+    cardProfile.timeline = '';
+    cardProfile.entities = '';
+    cardProfile.customWikiApi = '';
+    cardProfile.lastAutoWorkTitle = '';
+    cardProfile.lastAutoTimeline = '';
+    cardProfile.lastAutoEntities = [];
+    cardProfile.canonDatabase = {};
+    cardProfile.canonWorldBook = '';
+    cardProfile.canonDatabaseFormatVersion = 4;
+    cardProfile.conversationId = conversationId;
+}
+
+function profileHasConversationData(cardProfile = profile()) {
+    return Boolean(
+        String(cardProfile.workTitle || '').trim()
+        || String(cardProfile.timeline || '').trim()
+        || String(cardProfile.entities || '').trim()
+        || String(cardProfile.customWikiApi || '').trim()
+        || String(cardProfile.canonWorldBook || '').trim()
+        || Object.keys(cardProfile.canonDatabase || {}).length
+        || cleanDetectedEntities(cardProfile.lastAutoEntities).length
+    );
+}
+
+function captureScopeToken() {
+    const currentProfileKey = profileKey();
+    const conversationId = currentConversationId();
+    const scope = scopeIdentity(currentProfileKey, conversationId);
+    return {
+        epoch: scopeEpochs.get(scope) || 0,
+        profileKey: currentProfileKey,
+        conversationId,
+    };
+}
+
+function scopeTokenIsCurrent(token) {
+    const currentProfileKey = profileKey();
+    const conversationId = currentConversationId();
+    const scope = scopeIdentity(currentProfileKey, conversationId);
+    return token?.epoch === (scopeEpochs.get(scope) || 0)
+        && token?.profileKey === currentProfileKey
+        && token?.conversationId === conversationId;
 }
 
 function escapeHtml(value) {
@@ -900,20 +971,22 @@ async function fetchWikiFallback(apiUrl, page, sourceName, query) {
     };
 }
 
-async function searchWiki(apiUrl, query, sourceName) {
-    const config = settings();
-    const key = `${apiUrl}|${query}`;
-    const cached = config.cache[key];
-    const maxAge = config.cacheMinutes * 60 * 1000;
-    if (cached?.at && Date.now() - cached.at < maxAge && Array.isArray(cached.pages)) {
-        return cached.pages;
-    }
+function wikiQueryVariants(query) {
+    const raw = String(query ?? '').trim();
+    if (!raw) return [];
+    const compact = raw
+        .replace(/\s+(?:核对正式姓名(?:及原作)?(?:完整角色档案)?|原作完整角色档案|完整角色档案|角色档案)\s*[：:]?[\s\S]*$/i, '')
+        .trim();
+    return [...new Set([compact, raw].filter(Boolean))];
+}
 
+async function searchWikiOnce(apiUrl, searchQuery, resultQuery, sourceName) {
+    const config = settings();
     const url = new URL(apiUrl);
     url.search = new URLSearchParams({
         action: 'query',
         generator: 'search',
-        gsrsearch: query,
+        gsrsearch: searchQuery,
         gsrlimit: String(config.pagesPerQuery),
         prop: 'extracts|info',
         explaintext: '1',
@@ -934,16 +1007,41 @@ async function searchWiki(apiUrl, query, sourceName) {
         extract: stripMarkup(page.extract).slice(0, config.maxPageChars),
         url: page.fullurl || '',
         source: sourceName,
-        query,
+        query: resultQuery,
     }));
     if (!pages.length && candidates.length) {
-        const fallback = await Promise.allSettled(candidates.map(page => fetchWikiFallback(apiUrl, page, sourceName, query)));
+        const fallback = await Promise.allSettled(candidates
+            .map(page => fetchWikiFallback(apiUrl, page, sourceName, resultQuery)));
         pages.push(...fallback.flatMap(result => result.status === 'fulfilled' && result.value ? [result.value] : []));
     }
-    config.cache[key] = { at: Date.now(), pages };
-    pruneCache();
-    saveSettingsDebounced();
     return pages;
+}
+
+async function searchWiki(apiUrl, query, sourceName) {
+    const config = settings();
+    const key = `${apiUrl}|${query}`;
+    const cached = config.cache[key];
+    const maxAge = config.cacheMinutes * 60 * 1000;
+    if (cached?.at && Date.now() - cached.at < maxAge && Array.isArray(cached.pages) && cached.pages.length) {
+        return cached.pages;
+    }
+
+    let lastError = null;
+    for (const searchQuery of wikiQueryVariants(query)) {
+        try {
+            const pages = await searchWikiOnce(apiUrl, searchQuery, query, sourceName);
+            if (!pages.length) continue;
+            // Empty results can be temporary, so only successful lookups are cached.
+            config.cache[key] = { at: Date.now(), pages };
+            pruneCache();
+            saveSettingsDebounced();
+            return pages;
+        } catch (error) {
+            lastError = error;
+        }
+    }
+    if (lastError) throw lastError;
+    return [];
 }
 
 const SEARCH_SECRET_KEYS = {
@@ -1372,9 +1470,11 @@ function formatCanonWorldEntry(record) {
 }
 
 async function syncCanonDatabaseToWorldBook(entities) {
+    const scopeToken = captureScopeToken();
     const worldName = currentWorldBookName();
     if (!worldName) return false;
     const data = await loadWorldInfo(worldName);
+    if (!scopeTokenIsCurrent(scopeToken)) return false;
     if (!data?.entries) return false;
     const database = storedCanonEntities();
     const databaseChanged = sanitizeCanonDatabase(database);
@@ -1431,7 +1531,9 @@ async function syncCanonDatabaseToWorldBook(entities) {
         }
     }
     if (changed || databaseChanged) {
+        if (!scopeTokenIsCurrent(scopeToken)) return false;
         await saveWorldInfo(worldName, data, true);
+        if (!scopeTokenIsCurrent(scopeToken)) return false;
         reloadEditor(worldName, false);
         profile().canonWorldBook = worldName;
         saveSettingsDebounced();
@@ -1439,14 +1541,14 @@ async function syncCanonDatabaseToWorldBook(entities) {
     return changed;
 }
 
-async function clearCanonWorldBookEntries() {
-    const worldName = currentWorldBookName();
+async function clearCanonWorldBookEntries(targetProfileKey = profileKey(), targetWorldName = currentWorldBookName()) {
+    const worldName = String(targetWorldName || '').trim();
     if (!worldName) return;
     const data = await loadWorldInfo(worldName);
     if (!data?.entries) return;
     let changed = false;
     for (const [uid, entry] of Object.entries(data.entries)) {
-        if (parseWorldEntryComment(entry?.comment, profileKey())) {
+        if (parseWorldEntryComment(entry?.comment, targetProfileKey)) {
             delete data.entries[uid];
             changed = true;
         }
@@ -1455,6 +1557,88 @@ async function clearCanonWorldBookEntries() {
         await saveWorldInfo(worldName, data, true);
         reloadEditor(worldName, false);
     }
+}
+
+async function clearProfileWorldBookEntries(cardProfile, targetProfileKey = profileKey()) {
+    const worldNames = [...new Set([
+        currentWorldBookName(),
+        String(cardProfile?.canonWorldBook || '').trim(),
+    ].filter(Boolean))];
+    for (const worldName of worldNames) {
+        await clearCanonWorldBookEntries(targetProfileKey, worldName);
+    }
+}
+
+async function resetCurrentConversationData({ reason = '已重置当前聊天的全部同人资料' } = {}) {
+    const cardProfile = profile();
+    const targetProfileKey = profileKey();
+    const conversationId = currentConversationId();
+    clearRuntimeState();
+    await clearProfileWorldBookEntries(cardProfile, targetProfileKey);
+    clearConversationProfile(cardProfile, conversationId);
+    saveSettingsDebounced();
+    loadProfileIntoPanel();
+    updateReport(reason);
+}
+
+async function ensureConversationScope() {
+    if (conversationTransition) await conversationTransition;
+    const conversationId = currentConversationId();
+    if (!conversationId) return false;
+
+    const cardProfile = profile();
+    if (!cardProfile.conversationId) {
+        cardProfile.conversationId = conversationId;
+        saveSettingsDebounced();
+        return false;
+    }
+    if (cardProfile.conversationId === conversationId) return false;
+
+    const previousConversationId = cardProfile.conversationId;
+    const targetProfileKey = profileKey();
+    conversationTransition = (async () => {
+        clearRuntimeState();
+        await clearProfileWorldBookEntries(cardProfile, targetProfileKey);
+        clearConversationProfile(cardProfile, conversationId);
+        saveSettingsDebounced();
+        loadProfileIntoPanel();
+        updateReport(`检测到同一角色卡已切换到新聊天；旧聊天“${previousConversationId}”的插件资料已隔离并清空`);
+    })().finally(() => {
+        conversationTransition = null;
+    });
+    await conversationTransition;
+    return true;
+}
+
+async function reconcileDeletedWorldBookEntries() {
+    const scopeToken = captureScopeToken();
+    const cardProfile = profile();
+    const database = storedCanonEntities();
+    const recordNames = Object.keys(database);
+    const worldName = String(cardProfile.canonWorldBook || '').trim();
+    if (!recordNames.length || !worldName) return false;
+    const data = await loadWorldInfo(worldName);
+    if (!scopeTokenIsCurrent(scopeToken)) return false;
+
+    const presentEntities = new Set(Object.values(data?.entries || {})
+        .map(entry => parseWorldEntryComment(entry?.comment, profileKey()))
+        .filter(Boolean)
+        .map(canonicalEntityKey));
+    const removedRecords = recordNames.filter(name => !presentEntities.has(canonicalEntityKey(name)));
+    if (!removedRecords.length) return false;
+
+    const removedAliases = new Set(removedRecords
+        .flatMap(name => [name, ...recordAliases(database[name], name)])
+        .map(canonicalEntityKey));
+    for (const name of removedRecords) delete database[name];
+    const keepEntity = name => !removedAliases.has(canonicalEntityKey(name));
+    cardProfile.entities = manualEntities(cardProfile.entities).filter(keepEntity).join('，');
+    cardProfile.lastAutoEntities = cleanDetectedEntities(cardProfile.lastAutoEntities).filter(keepEntity);
+    clearRuntimeState();
+    saveSettingsDebounced();
+    loadProfileIntoPanel();
+    updateReport(`检测到世界书中手动删除了 ${removedRecords.join('、')}；对应插件资料已同步清除，不会再次自动重建`);
+    return true;
 }
 
 function targetRecordsForChange(change, planEntities, database) {
@@ -1645,6 +1829,7 @@ function canonProfileHash(record) {
 const PROFILE_RETRY_MINUTES = 10;
 
 async function ensureCanonProfiles(plan) {
+    const scopeToken = captureScopeToken();
     const database = storedCanonEntities();
     const pending = [];
     for (const entity of cleanDetectedEntities(plan.entities)) {
@@ -1675,6 +1860,7 @@ async function ensureCanonProfiles(plan) {
     try {
         updateReport('分析模型正在按当前时间线压缩角色档案…');
         const parsed = await runJsonAnalysisPrompt(prompt, 4200);
+        if (!scopeTokenIsCurrent(scopeToken)) return [];
         const profiles = parsed && typeof parsed.profiles === 'object' ? parsed.profiles : {};
         const byKey = new Map(Object.entries(profiles)
             .map(([key, value]) => [canonicalEntityKey(key), String(value ?? '').trim()]));
@@ -1693,6 +1879,7 @@ async function ensureCanonProfiles(plan) {
         }
         return updated;
     } catch (error) {
+        if (!scopeTokenIsCurrent(scopeToken)) return [];
         console.warn('[Fandom Canon] Profile compression failed; falling back to raw extracts.', error);
         const attemptedAt = Date.now();
         for (const { record, hash } of limited) {
@@ -1726,7 +1913,7 @@ function reviewContextSummary(chat, messageId) {
         .join('\n');
 }
 
-function buildReviewPrompt(body, records, recent) {
+function buildReviewPrompt(body, records, recent, overrideContext = {}) {
     const cardProfile = profile();
     const profiles = records.map(record => {
         const text = String(record.profile || '').trim()
@@ -1735,7 +1922,7 @@ function buildReviewPrompt(body, records, recent) {
             ? record.canonChanges.join('；') : '';
         return `【${record.entity}】（${record.work || '作品未确认'}）\n${text}${changes ? `\n已确认AU差异：${changes}` : ''}`;
     }).join('\n\n');
-    return `你是同人正文的原作设定审核员。下面给你：①刚生成的正文；②参与本段剧情的原作角色档案（已按当前时间线过滤）；③此前剧情概要。请逐句核对正文与档案是否冲突，冲突范围包括：姓名译名、年龄身份、外貌（发色发型瞳色身材穿着）、性格与行为逻辑、能力、经历、人际关系、人物认知，以及当前时间线节点之后才应发生的事件。\n\n判定规则：角色卡设定、用户明确指示、档案中标注的已确认AU差异、以及此前剧情已明确建立或解释过的事实，一律视为有效设定，不是冲突，不得修订；只有正文与档案冲突、且上述依据都没有解释的情况才需要修订。拿不准的一律判通过；档案未写明的细节不算冲突。\n\n修订要求：只改冲突片段本身，保持原句式、语气、篇幅与剧情走向，不得增删无关内容；修正后的表述必须与档案一致。\n\n只输出 JSON：无冲突输出 {"verdict":"pass","revisions":[]}；有冲突输出 {"verdict":"conflict","revisions":[{"original":"逐字摘录正文中需要修改的连续片段","revised":"按档案修正后的片段","entity":"角色名","reason":"简短原因"}]}。original 必须逐字复制正文原文（保留星号等标记，不含省略号），否则无法应用。\n\n当前时间线/AU节点：${cardProfile.timeline || '未填写'}\n\n角色档案：\n${profiles}\n\n此前剧情概要：\n${recent || '无'}\n\n待审核正文：\n${body}`;
+    return `你是同人正文的原作设定审核员。下面给你：①角色卡和当前激活世界书中的优先设定；②刚生成的正文；③参与本段剧情的原作角色档案（已按当前时间线过滤）；④此前剧情概要。请逐句核对正文与档案是否冲突，冲突范围包括：姓名译名、年龄身份、外貌（发色发型瞳色身材穿着）、性格与行为逻辑、能力、经历、人际关系、人物认知，以及当前时间线节点之后才应发生的事件。\n\n判定规则：角色卡设定、用户明确指示、档案中标注的已确认AU差异、以及此前剧情已明确建立或解释过的事实，一律视为有效设定，不是冲突，不得修订；只有正文与档案冲突、且上述依据都没有解释的情况才需要修订。拿不准的一律判通过；档案未写明的细节不算冲突。\n\n修订要求：只改冲突片段本身，保持原句式、语气、篇幅与剧情走向，不得增删无关内容；修正后的表述必须与档案一致。\n\n只输出 JSON：无冲突输出 {"verdict":"pass","revisions":[]}；有冲突输出 {"verdict":"conflict","revisions":[{"original":"逐字摘录正文中需要修改的连续片段","revised":"按档案修正后的片段","entity":"角色名","reason":"简短原因"}]}。original 必须逐字复制正文原文（保留星号等标记，不含省略号），否则无法应用。\n\n当前时间线/AU节点：${cardProfile.timeline || '未填写'}\n\n角色卡优先设定：\n${String(overrideContext.card || '未读取到').slice(0, 7000)}\n\n当前激活世界书优先设定：\n${String(overrideContext.worldInfo || '无').slice(0, 7000)}\n\n角色档案：\n${profiles}\n\n此前剧情概要：\n${recent || '无'}\n\n待审核正文：\n${body}`;
 }
 
 function applyTextRevisions(text, revisions) {
@@ -1744,8 +1931,11 @@ function applyTextRevisions(text, revisions) {
     for (const revision of Array.isArray(revisions) ? revisions : []) {
         const original = String(revision?.original ?? '').trim();
         const revised = String(revision?.revised ?? '').trim();
-        if (!original || !revised || original === revised) continue;
-        if (!updated.includes(original)) continue;
+        if (original.length < 2 || !revised || original === revised) continue;
+        const firstIndex = updated.indexOf(original);
+        if (firstIndex < 0 || updated.lastIndexOf(original) !== firstIndex) continue;
+        const maximumLength = Math.max(original.length * 4, original.length + 240);
+        if (revised.length > maximumLength) continue;
         updated = updated.replace(original, () => revised);
         applied.push({
             original,
@@ -1754,12 +1944,18 @@ function applyTextRevisions(text, revisions) {
             reason: String(revision?.reason ?? '').trim(),
         });
     }
+    if (applied.length && Math.abs(updated.length - String(text ?? '').length) > Math.max(1200, String(text ?? '').length * 0.35)) {
+        return { updated: String(text ?? ''), applied: [] };
+    }
     return { updated, applied };
 }
 
 async function reviewGeneratedMessage(messageId, type) {
     const config = settings();
     if (!config.reviewEnabled || REVIEW_SKIP_TYPES.has(String(type ?? ''))) return;
+    await ensureConversationScope();
+    await reconcileDeletedWorldBookEntries();
+    const scopeToken = captureScopeToken();
     const context = getContext();
     const chat = Array.isArray(context.chat) ? context.chat : [];
     const index = Number(messageId);
@@ -1772,12 +1968,15 @@ async function reviewGeneratedMessage(messageId, type) {
     const recent = reviewContextSummary(chat, index);
     const records = relevantCanonRecords(`${body}\n${recent}`, database).slice(0, 6);
     if (!records.length) return;
-    const signature = `${index}:${textHash(body)}`;
+    const signature = `${scopeIdentity()}|${index}:${textHash(body)}`;
     if (reviewedMessageSignatures.has(signature)) return;
     reviewedMessageSignatures.add(signature);
     try {
         updateReport(`正在按本卡原作资料审核刚生成的正文（涉及 ${records.map(record => record.entity).join('、')}）…`);
-        const parsed = await runJsonAnalysisPrompt(buildReviewPrompt(body.slice(0, 8000), records, recent), 2000);
+        const overrideContext = await researchContext(chat.slice(0, index + 1));
+        if (!scopeTokenIsCurrent(scopeToken)) return;
+        const parsed = await runJsonAnalysisPrompt(buildReviewPrompt(body.slice(0, 12000), records, recent, overrideContext), 2400);
+        if (!scopeTokenIsCurrent(scopeToken)) return;
         const revisions = Array.isArray(parsed?.revisions) ? parsed.revisions : [];
         if (parsed?.verdict !== 'conflict' || !revisions.length) {
             updateReport('正文审核完成：与本卡原作资料没有需要修订的未解释冲突');
@@ -1792,6 +1991,7 @@ async function reviewGeneratedMessage(messageId, type) {
             updateReport(`审核发现 ${revisions.length} 处疑似冲突，但无法在正文中逐字定位，未自动修订`);
             return;
         }
+        if (!scopeTokenIsCurrent(scopeToken)) return;
         message.mes = updated;
         message.extra ??= {};
         if (typeof message.extra.display_text === 'string') message.extra.display_text = updated;
@@ -1799,7 +1999,9 @@ async function reviewGeneratedMessage(messageId, type) {
         if (Array.isArray(message.swipes) && Number.isInteger(message.swipe_id)) {
             message.swipes[message.swipe_id] = updated;
         }
+        if (!scopeTokenIsCurrent(scopeToken)) return;
         await context.saveChat();
+        if (!scopeTokenIsCurrent(scopeToken)) return;
         updateMessageBlock(index, message);
         const reasons = [...new Set(applied
             .map(item => `${item.entity || '角色'}：${item.reason || '与原作资料不符'}`))].join('；');
@@ -1807,6 +2009,8 @@ async function reviewGeneratedMessage(messageId, type) {
         updateReport(`已自动修正 ${applied.length} 处与原作资料的冲突（${reasons.slice(0, 300)}）`);
         console.info('[Fandom Canon] Auto-revised canon conflicts.', applied);
     } catch (error) {
+        if (!scopeTokenIsCurrent(scopeToken)) return;
+        reviewedMessageSignatures.delete(signature);
         console.warn('[Fandom Canon] Post-generation review failed.', error);
         updateReport(`正文审核失败（不影响已生成内容）：${error?.message || error}`);
     }
@@ -1865,18 +2069,20 @@ async function retrieve(plan) {
 }
 
 function researchJobKey(plan) {
-    return `${profileKey()}|${settings().searchProvider}|${settings().searchAiModel}|${(plan.queries || []).join('|')}`;
+    return `${scopeIdentity()}|${settings().searchProvider}|${settings().searchAiModel}|${(plan.queries || []).join('|')}`;
 }
 
 function startCanonEnrichment(plan) {
     const key = researchJobKey(plan);
     const existing = inFlightResearch.get(key);
     if (existing) return existing;
+    const scopeToken = captureScopeToken();
 
     const job = (async () => {
         const pages = await retrieve(plan);
+        if (!scopeTokenIsCurrent(scopeToken)) return [];
         await saveCanonResearch(plan, pages);
-        return pages;
+        return scopeTokenIsCurrent(scopeToken) ? pages : [];
     })().finally(() => inFlightResearch.delete(key));
     // Attach a rejection handler immediately so a background request can never
     // become an unhandled promise rejection after generation has continued.
@@ -1902,6 +2108,9 @@ async function waitForResearch(job, seconds) {
 }
 
 async function autoFillCurrentProfile() {
+    await ensureConversationScope();
+    await reconcileDeletedWorldBookEntries();
+    const scopeToken = captureScopeToken();
     const startedAt = performance.now();
     const secondsSince = mark => ((performance.now() - mark) / 1000).toFixed(1);
     const cardProfile = profile();
@@ -1918,6 +2127,7 @@ async function autoFillCurrentProfile() {
         const identifyStartedAt = performance.now();
         const firstPrompt = `你是同人资料识别助手。必须阅读角色卡正文、世界书和最近剧情，判断是否涉及已有作品，以及剧情属于原作时间线、AU，还是仅借用了同人角色的用户原创世界。角色卡标题只是文件名，不得把标题本身当人物、作品或搜索实体。\n\n只输出 JSON：{"workTitle":"正文能明确确认的作品正式名称；多作品时写多作品交叉同人（当前涉及：作品名）","storyType":"canon_timeline|au_timeline|original_world_with_fandom_characters|original_only|unknown","timeline":"原作/AU节点；若仅含同人角色但剧情是原创世界，则写用户原创世界（仅含同人角色，非原作剧情）；完全无法判断则空字符串","entities":["本轮刚出现、正在场或上下文明确即将登场且需要核实原作资料的具体人物/地点/组织"],"queries":["带人物各自作品名和具体专有名词的全网检索词"]}。不确定的字段留空，不得编造；不要输出“兄妹”“OC”“角色卡”等泛称；用户原创人物不要作为外部检索实体；世界书中的全部候选角色不等于本轮都要搜索，只选择最近剧情相关对象；queries 最多 ${settings().maxQueries} 条，没有具体核实对象就返回空数组。\n\n角色卡正文：\n${source.card || '未读取到'}\n\n当前触发及角色卡内置世界书：\n${source.worldInfo || '无'}\n\n最近剧情：\n${source.recent || '暂无聊天内容。'}`;
         const first = await runJsonAnalysisPrompt(firstPrompt, 2000);
+        if (!scopeTokenIsCurrent(scopeToken)) return;
         const identifySeconds = secondsSince(identifyStartedAt);
         const workTitle = String(first.workTitle || cardProfile.workTitle || '').trim();
         const originalWorld = first.storyType === 'original_world_with_fandom_characters' || first.storyType === 'original_only';
@@ -1964,12 +2174,15 @@ async function autoFillCurrentProfile() {
         if (needsResearch) {
             const backgroundStartedAt = performance.now();
             startCanonEnrichment(provisional).then(async pages => {
+                if (!scopeTokenIsCurrent(scopeToken)) return;
                 const searchSeconds = secondsSince(backgroundStartedAt);
                 await ensureCanonProfiles(provisional);
+                if (!scopeTokenIsCurrent(scopeToken)) return;
                 updateReport(`后台检索完成：已保存 ${pages.length} 条资料并压缩为时间线内档案（${searchSeconds} 秒）`, provisional, pages);
             }).catch(error => updateReport(`表格已填写，但后台检索失败：${error?.message || error}`, provisional));
         }
     } catch (error) {
+        if (!scopeTokenIsCurrent(scopeToken)) return;
         console.error('[Fandom Canon] Auto-fill failed.', error);
         updateReport(`自动填写失败：${error?.message || error}`);
         toastr.error(error?.message || String(error), '自动填写失败');
@@ -2030,6 +2243,9 @@ function conversationSignature(chat) {
 }
 
 async function runPreflight(chat, type = 'normal', force = false) {
+    await ensureConversationScope();
+    await reconcileDeletedWorldBookEntries();
+    const scopeToken = captureScopeToken();
     const startedAt = performance.now();
     const elapsed = () => ((performance.now() - startedAt) / 1000).toFixed(1);
     if (busy) return;
@@ -2054,6 +2270,7 @@ async function runPreflight(chat, type = 'normal', force = false) {
     updateReport('正在规划检索…');
     try {
         const plan = await planQueries(chat);
+        if (!scopeTokenIsCurrent(scopeToken)) return;
         syncProfileFromPlan(plan);
         const storedPages = loadCanonResearch(plan);
         const missingEntities = missingCanonEntities(plan);
@@ -2073,10 +2290,12 @@ async function runPreflight(chat, type = 'normal', force = false) {
             if (missingEntities.length) {
                 updateReport(`检测到新原作对象：${missingEntities.join('、')}；正在核对正式姓名与完整档案，最多等待 ${settings().newEntityWaitSeconds} 秒，超时转入后台下轮补全（${elapsed()} 秒）`, plan);
                 const result = await waitForResearch(startCanonEnrichment(plan), settings().newEntityWaitSeconds);
+                if (!scopeTokenIsCurrent(scopeToken)) return;
                 fetchedPages = result.pages;
                 timedOut = result.timedOut;
             } else {
                 const result = await waitForResearch(startCanonEnrichment(plan), settings().searchWaitSeconds);
+                if (!scopeTokenIsCurrent(scopeToken)) return;
                 fetchedPages = result.pages;
                 timedOut = result.timedOut;
             }
@@ -2093,6 +2312,7 @@ async function runPreflight(chat, type = 'normal', force = false) {
             return;
         }
         await ensureCanonProfiles(plan);
+        if (!scopeTokenIsCurrent(scopeToken)) return;
         const reference = buildReference(plan);
         setExtensionPrompt(PROMPT_KEY, reference, extension_prompt_types.IN_PROMPT, 0, false, extension_prompt_roles.SYSTEM);
         lastReferenceText = reference;
@@ -2103,11 +2323,12 @@ async function runPreflight(chat, type = 'normal', force = false) {
         console.info('[Fandom Canon] Reference injected.', { plan, pages });
         if (!timedOut) lastRunSignature = signature;
     } catch (error) {
+        if (!scopeTokenIsCurrent(scopeToken)) return;
         console.error('[Fandom Canon] Retrieval failed.', error);
         lastRunSignature = '';
         updateReport(`检索失败：${error?.message || error}`);
     } finally {
-        busy = false;
+        if (scopeTokenIsCurrent(scopeToken)) busy = false;
     }
 }
 
@@ -2205,7 +2426,7 @@ function panelHtml() {
                     <button id="fcr-auto-fill" class="menu_button"><i class="fa-solid fa-wand-magic-sparkles"></i> AI识别并填写本卡</button>
                     <button id="fcr-test" class="menu_button"><i class="fa-solid fa-magnifying-glass"></i> 立即检索测试</button>
                     <button id="fcr-clear-cache" class="menu_button"><i class="fa-solid fa-trash-can"></i> 清空缓存</button>
-                    <button id="fcr-clear-database" class="menu_button"><i class="fa-solid fa-database"></i> 清空本卡资料库</button>
+                    <button id="fcr-clear-database" class="menu_button"><i class="fa-solid fa-rotate-left"></i> 重置本局全部资料</button>
                 </div>
                 <div id="fcr-report" class="fcr-report"></div>
             </div>
@@ -2402,12 +2623,10 @@ function bindPanel() {
         updateReport('缓存已清空');
     });
     $('#fcr-clear-database').on('click', async () => {
-        profile().canonDatabase = {};
-        lastRunSignature = '';
-        lastReferenceText = '';
-        await clearCanonWorldBookEntries();
-        saveSettingsDebounced();
-        updateReport('当前角色卡的持久资料库及插件世界书条目已清空；下次生成会重新检索');
+        await resetCurrentConversationData({
+            reason: '当前角色卡本局的表格、资料库、注入提示和插件世界书条目已全部清空；其他角色卡的资料和缓存未受影响',
+        });
+        toastr.success('当前角色卡本局资料已彻底重置；其他角色卡未受影响。', '晋阳的同人库');
     });
 }
 
@@ -2423,6 +2642,8 @@ async function openSettingsPopup() {
         return;
     }
 
+    await ensureConversationScope();
+    await reconcileDeletedWorldBookEntries();
     loadProfileIntoPanel();
     const home = document.createComment('fandom-canon-panel-home');
     panel.before(home);
@@ -2479,6 +2700,7 @@ function installMainEntries() {
 
 async function refreshOrMigrateCanonDatabase() {
     if (!currentCharacter()) return;
+    await ensureConversationScope();
     const cardProfile = profile();
     if ((cardProfile.canonDatabaseFormatVersion || 0) < 4) {
         await clearCanonWorldBookEntries();
@@ -2493,8 +2715,7 @@ async function refreshOrMigrateCanonDatabase() {
             .catch(error => console.error('[Fandom Canon] Could not rebuild canon database.', error));
         return;
     }
-    const entities = Object.keys(storedCanonEntities());
-    if (entities.length) await syncCanonDatabaseToWorldBook(entities);
+    await reconcileDeletedWorldBookEntries();
 }
 
 function initialize() {
@@ -2515,14 +2736,31 @@ function initialize() {
     }, 500);
     setTimeout(() => clearInterval(entryTimer), 15000);
     const context = getContext();
-    context.eventSource?.on?.(context.eventTypes?.CHAT_CHANGED ?? 'chat_changed', () => setTimeout(() => {
-        lastRunSignature = '';
-        lastReferenceText = '';
-        reviewedMessageSignatures.clear();
-        loadProfileIntoPanel();
-        refreshOrMigrateCanonDatabase()
-            .catch(error => console.error('[Fandom Canon] Could not refresh canon database.', error));
+    context.eventSource?.on?.(context.eventTypes?.CHAT_CHANGED ?? 'chat_changed', () => setTimeout(async () => {
+        clearRuntimeState();
+        try {
+            await ensureConversationScope();
+            loadProfileIntoPanel();
+            await refreshOrMigrateCanonDatabase();
+        } catch (error) {
+            console.error('[Fandom Canon] Could not refresh canon database.', error);
+        }
     }, 150));
+    context.eventSource?.on?.(context.eventTypes?.MESSAGE_DELETED ?? 'message_deleted', () => setTimeout(async () => {
+        try {
+            await ensureConversationScope();
+            const visibleMessages = (Array.isArray(getContext().chat) ? getContext().chat : [])
+                .filter(message => message && !message.is_system);
+            const hasUserMessage = visibleMessages.some(message => message.is_user);
+            if (!hasUserMessage && visibleMessages.length <= 1 && profileHasConversationData()) {
+                await resetCurrentConversationData({
+                    reason: '检测到聊天记录已清空；当前角色卡本局资料已自动重置，其他角色卡未受影响',
+                });
+            }
+        } catch (error) {
+            console.error('[Fandom Canon] Could not reset data after chat deletion.', error);
+        }
+    }, 250));
     context.eventSource?.on?.(context.eventTypes?.MESSAGE_RECEIVED ?? 'message_received', (messageId, type) => {
         reviewGeneratedMessage(messageId, type)
             .catch(error => console.error('[Fandom Canon] Could not review generated message.', error));
