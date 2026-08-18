@@ -22,14 +22,26 @@ const MENU_ENTRY_ID = 'fandom-canon-menu-entry';
 const LOCAL_CREDENTIAL_PREFIX = 'sillytavern-fandom-canon-retriever';
 const WORLD_ENTRY_PREFIX = '【同人原作资料库·插件自动维护】';
 const WORLD_ENTRY_MARKER = '·同人原作资料库·';
-const EXTENSION_VERSION = '2.3.7';
-// Keep this list and CHANGELOG.md in sync for every release.
-const RELEASE_NOTES = [
-    '正常生成改为立即放行，不再在正文生成前调用分析或搜索 API，避免插件导致等待、空回复或额外 429。',
-    '手动核验只识别用户最新输入中明确点名的对象，不再从角色卡、世界书或历史剧情推测下一位登场角色。',
-    '生成后审核只检查正文中实际出现的角色，并严格禁止改变剧情走向、登场角色、行动结果和场景顺序。',
-    '自动修订仅允许替换最短冲突片段，并增加长度与扩写限制，防止审核模型整段重写正文。',
-];
+const EXTENSION_VERSION = '2.3.8';
+// Keep this history and CHANGELOG.md in sync for every release.
+const RELEASE_HISTORY = [{
+    version: '2.3.8',
+    notes: [
+        '当前人物/地点改为场景快照：自动项会随角色进场、离场和地点切换增减，不再永久累加。',
+        '用户手动添加的人物或地点继续保留；离场角色的历史档案仍留在本卡资料库，回归时可以直接复用。',
+        '作品、时间线和时间节点只在正文明确切换时更新，不允许分析模型自行推进剧情。',
+        '场景状态更新与生成后 OOC 审核合并为一次异步分析请求，不阻塞正文，也不额外重复调用分析 API。',
+    ],
+}, {
+    version: '2.3.7',
+    notes: [
+        '正常生成改为立即放行，不再在正文生成前调用分析或搜索 API，避免插件导致等待、空回复或额外 429。',
+        '手动核验只识别用户最新输入中明确点名的对象，不再从角色卡、世界书或历史剧情推测下一位登场角色。',
+        '生成后审核只检查正文中实际出现的角色，并严格禁止改变剧情走向、登场角色、行动结果和场景顺序。',
+        '自动修订仅允许替换最短冲突片段，并增加长度与扩写限制，防止审核模型整段重写正文。',
+    ],
+}];
+const RELEASE_NOTES = RELEASE_HISTORY[0].notes;
 const DEFAULTS = {
     enabled: true,
     language: 'zh',
@@ -83,8 +95,12 @@ function releaseNotesStorageKey() {
     return `${LOCAL_CREDENTIAL_PREFIX}:${getCurrentUserHandle()}:release-notes-seen`;
 }
 
-function releaseNotesListHtml() {
-    return `<ul>${RELEASE_NOTES.map(note => `<li>${note}</li>`).join('')}</ul>`;
+function releaseNotesListHtml(notes = RELEASE_NOTES) {
+    return `<ul>${notes.map(note => `<li>${note}</li>`).join('')}</ul>`;
+}
+
+function releaseHistoryHtml() {
+    return RELEASE_HISTORY.map(release => `<section class="fcr-release-version"><b>v${release.version}</b>${releaseNotesListHtml(release.notes)}</section>`).join('');
 }
 
 async function showReleaseNotesOnce() {
@@ -754,6 +770,20 @@ function cleanEntityCandidates(values) {
     return candidates.slice(0, 40);
 }
 
+function cleanSceneEntityCandidates(values) {
+    const candidates = [];
+    for (const value of Array.isArray(values) ? values : []) {
+        const raw = typeof value === 'string' ? { candidateName: value } : (value || {});
+        const candidate = cleanEntityCandidates([raw])[0];
+        if (!candidate) continue;
+        const kind = String(raw.kind ?? raw.type ?? '').toLowerCase();
+        if (!['character', 'location'].includes(kind)) continue;
+        if (candidates.some(item => canonicalEntityKey(item.candidateName) === canonicalEntityKey(candidate.candidateName))) continue;
+        candidates.push({ ...candidate, kind });
+    }
+    return candidates.slice(0, 40);
+}
+
 function recordAliases(record, fallbackName = '') {
     return cleanDetectedEntities([
         fallbackName,
@@ -916,11 +946,14 @@ function syncProfileFromPlan(plan) {
     });
     const currentEntities = manualEntities(cardProfile.entities);
     const previousAutoEntities = cleanDetectedEntities(cardProfile.lastAutoEntities);
-    const manualFixed = currentEntities.filter(entity => !previousAutoEntities.includes(entity));
+    const previousAutoKeys = new Set(previousAutoEntities.map(canonicalEntityKey));
+    const manualFixed = currentEntities.filter(entity => !previousAutoKeys.has(canonicalEntityKey(entity)));
     const database = storedCanonEntities();
     const newlyDetectedEntities = cleanDetectedEntities(plan.autoEntities ?? plan.entities)
         .map(entity => resolveCanonEntityName(entity, database));
-    const nextAutoEntities = [...new Set([...previousAutoEntities, ...newlyDetectedEntities])].slice(0, 40);
+    const nextAutoEntities = plan.replaceAutoEntities === true
+        ? [...new Set(newlyDetectedEntities)].slice(0, 40)
+        : [...new Set([...previousAutoEntities, ...newlyDetectedEntities])].slice(0, 40);
     const nextEntities = [...new Set([...manualFixed, ...nextAutoEntities])].slice(0, 40);
 
     if (plan.work && (!cardProfile.workTitle || cardProfile.workTitle === cardProfile.lastAutoWorkTitle)) {
@@ -1945,7 +1978,7 @@ function reviewContextSummary(chat, messageId) {
         .join('\n');
 }
 
-function buildReviewPrompt(body, records, recent, overrideContext = {}) {
+function buildReviewPrompt(body, records, recent, overrideContext = {}, allowReview = true) {
     const cardProfile = profile();
     const profiles = records.map(record => {
         const text = String(record.profile || '').trim()
@@ -1954,7 +1987,65 @@ function buildReviewPrompt(body, records, recent, overrideContext = {}) {
             ? record.canonChanges.join('；') : '';
         return `【${record.entity}】（${record.work || '作品未确认'}）\n${text}${changes ? `\n已确认AU差异：${changes}` : ''}`;
     }).join('\n\n');
-    return `你是同人正文的原作设定审核员，不是编剧。下面给你：①角色卡和当前激活世界书中的优先设定；②已经由正文模型生成完毕的正文；③正文中实际出现的原作角色档案；④此前剧情概要。你只能核对姓名译名、年龄身份、外貌（发色发型瞳色身材穿着）、性格与行为逻辑、能力、经历、人际关系、人物认知和时间线事实是否 OOC。\n\n绝对边界：不得决定、建议或改变剧情走向；不得新增、删除或替换登场角色、地点、事件、行动、动机、对白轮次、因果关系或场景顺序；不得为了更贴近原作而把当前剧情改写成原作剧情。角色卡设定、用户明确指示、档案中标注的已确认 AU 差异、以及此前剧情已明确建立或解释过的事实，一律视为有效设定。拿不准的一律判通过；档案未写明的细节不算冲突。\n\n修订要求：只替换造成 OOC 的最短连续文字片段，保持原句式、语气、篇幅、行动结果和剧情走向不变。任何需要重写整段、改变事件或改变谁登场才能解决的问题都必须判通过，不得修订。\n\n只输出 JSON：无冲突输出 {"verdict":"pass","revisions":[]}；有冲突输出 {"verdict":"conflict","revisions":[{"original":"逐字摘录正文中需要修改的最短连续片段","revised":"只修正事实或人物表现的对应短片段","entity":"角色名","reason":"简短 OOC 原因"}]}。original 必须逐字复制正文原文（保留星号等标记，不含省略号），否则无法应用。\n\n当前时间线/AU节点：${cardProfile.timeline || '未填写'}\n\n角色卡优先设定：\n${String(overrideContext.card || '未读取到').slice(0, 7000)}\n\n当前激活世界书优先设定：\n${String(overrideContext.worldInfo || '无').slice(0, 7000)}\n\n角色档案：\n${profiles}\n\n此前剧情概要：\n${recent || '无'}\n\n待审核正文：\n${body}`;
+    const reviewRule = allowReview && records.length
+        ? '同时核对正文中实际出现、且下方有档案的原作角色是否存在姓名译名、年龄身份、外貌、性格行为、能力、经历、人际关系、人物认知或时间线事实冲突。只允许替换造成 OOC 的最短连续文字片段；不得改变剧情走向、登场角色、事件、行动结果、对白轮次、因果关系或场景顺序。拿不准一律判通过。'
+        : '本轮没有启用可执行的 OOC 审核。verdict 必须为 pass，revisions 必须为空数组。';
+    return `你负责在正文生成完毕后提取“当前场景事实快照”，并在允许时做原作事实审核。你不是编剧，绝对不得建议、预测、补写或改变后续剧情。\n\n任务一：根据此前剧情和待处理正文，返回正文结束瞬间的当前状态。currentEntities 只能包含：①此刻仍在当前场景中或正通过电话等方式直接参与当前互动的有名人物；②此刻所在的一个具体地点。kind 只能是 character 或 location。必须移除已经离场、上一场景人物、只被谈及的人物、回忆人物、未来可能登场者、组织、物品、能力、书籍和泛称。角色卡与世界书只用于确认身份，绝不能把其中的候选人物当成当前在场。旧快照是上一轮在场状态：若正文没有换场、跳时或明确写某人离开，应保留其中仍可能在场的人物和地点，即使最新一段没有再次点名；一旦正文明确换场或离场，则按新场景重建并移除旧项。若上下文足以判断完整当前快照，sceneComplete=true；若截断严重、无法可靠判断谁仍在场，则为 false，避免误删。用户在插件里手动固定的项目由程序保留，无需你保留。\n\n时间规则：timeline 是正文结束时已经明确成立的简短时间线/时间节点。只有正文明确发生日期、时段、篇章、原作事件阶段或 AU 关键状态切换时，timelineChanged 才为 true；不得因为普通对话、模型推测或为了推动故事而改时间线。没有明确变化时原样返回当前值并设为 false。作品发生明确切换或交叉作品焦点变化时才更新 workTitle。\n\n任务二：${reviewRule}\n\n角色卡设定、用户明确指示、已确认 AU 差异和此前剧情已经建立的事实优先于原作档案，不得修订。档案未写明的细节不算冲突。original 必须逐字复制正文中的最短连续原文。\n\n只输出完整 JSON：{"scene":{"sceneComplete":true,"workTitle":"当前明确作品；不变则沿用当前值","storyType":"canon_timeline|au_timeline|original_world_with_fandom_characters|original_only|unknown","timeline":"当前明确时间线或节点","timelineChanged":false,"currentEntities":[{"candidateName":"具体人物或地点名","kind":"character|location","isOriginal":false,"workHint":"所属作品；不确定留空","evidence":"证明其此刻仍在场或为当前地点的正文短语"}]},"verdict":"pass|conflict","revisions":[{"original":"正文最短连续原文","revised":"仅修正事实后的对应短片段","entity":"角色名","reason":"简短 OOC 原因"}]}\n\n当前作品：${cardProfile.workTitle || '未填写'}\n当前时间线/AU节点：${cardProfile.timeline || '未填写'}\n上一轮自动人物/地点快照（无离场或换场证据时作为延续基线）：${cleanDetectedEntities(cardProfile.lastAutoEntities).join('、') || '无'}\n\n角色卡优先设定：\n${String(overrideContext.card || '未读取到').slice(0, 7000)}\n\n当前激活世界书优先设定：\n${String(overrideContext.worldInfo || '无').slice(0, 7000)}\n\n可用于审核的角色档案：\n${profiles || '无'}\n\n此前剧情概要：\n${recent || '无'}\n\n待处理正文：\n${body}`;
+}
+
+function scenePlanFromAnalysis(scene) {
+    const cardProfile = profile();
+    const database = storedCanonEntities();
+    const candidates = cleanSceneEntityCandidates(scene?.currentEntities);
+    const allCurrentEntities = cleanDetectedEntities(candidates
+        .map(candidate => resolveCanonEntityName(candidate.candidateName, database)));
+    const canonCharacters = candidates
+        .filter(candidate => candidate.kind === 'character' && !candidate.isOriginal);
+    const canonEntities = cleanDetectedEntities(canonCharacters
+        .map(candidate => resolveCanonEntityName(candidate.candidateName, database)));
+    const missingEntities = canonEntities.filter(entity => {
+        const recordName = findCanonRecordName(entity, database);
+        return !recordName || (!database[recordName]?.sources?.length && !database[recordName]?.profile);
+    });
+    const work = String(scene?.workTitle || cardProfile.workTitle || '').trim();
+    const queries = missingEntities.map(entity => {
+        const candidate = canonCharacters.find(item => canonicalEntityKey(item.candidateName) === canonicalEntityKey(entity));
+        const workHint = candidate?.workHint || (shouldAttachWorkTitle(work) ? work : '');
+        return `${entity} ${workHint} 核对正式姓名及原作完整角色档案：身份、年龄、外貌身材、典型穿着、性格行为逻辑、能力、重要经历、人际关系、说话风格`.trim();
+    });
+    const proposedTimeline = String(scene?.timeline || cardProfile.timeline || '').trim();
+    const timelineChanged = scene?.timelineChanged === true
+        && Boolean(proposedTimeline)
+        && normalizeChangeText(proposedTimeline) !== normalizeChangeText(cardProfile.timeline);
+    return {
+        work,
+        timeline: timelineChanged ? proposedTimeline : cardProfile.timeline.trim(),
+        entities: canonEntities,
+        autoEntities: allCurrentEntities,
+        entityCandidates: canonCharacters,
+        canonChanges: [],
+        timelineChanged,
+        replaceAutoEntities: scene?.sceneComplete === true,
+        researchMode: missingEntities.length ? 'new_entities' : 'none',
+        queries: cleanPlannedQueries(queries, work).slice(0, settings().maxQueries),
+    };
+}
+
+function syncDynamicSceneState(scene, scopeToken) {
+    const plan = scenePlanFromAnalysis(scene);
+    const before = profile().entities;
+    syncProfileFromPlan(plan);
+    const changed = before !== profile().entities;
+    const missingEntities = missingCanonEntities(plan);
+    if (scopeTokenIsCurrent(scopeToken) && missingEntities.length && plan.queries.length) {
+        startCanonEnrichment(plan).then(async pages => {
+            if (!scopeTokenIsCurrent(scopeToken)) return;
+            await ensureCanonProfiles(plan);
+            if (!scopeTokenIsCurrent(scopeToken)) return;
+            updateReport(`当前场景已更新；新原作角色资料已后台写入 ${pages.length} 条`, plan, pages);
+        }).catch(error => console.error('[Fandom Canon] Scene character enrichment failed.', error));
+    }
+    return { plan, changed };
 }
 
 function applyTextRevisions(text, revisions) {
@@ -1985,7 +2076,9 @@ function applyTextRevisions(text, revisions) {
 
 async function reviewGeneratedMessage(messageId, type) {
     const config = settings();
-    if (!config.reviewEnabled || REVIEW_SKIP_TYPES.has(String(type ?? ''))) return;
+    if (REVIEW_SKIP_TYPES.has(String(type ?? ''))) return;
+    const trackScene = config.enabled && config.autoUpdateProfile;
+    if (!trackScene && !config.reviewEnabled) return;
     await ensureConversationScope();
     await reconcileDeletedWorldBookEntries();
     const scopeToken = captureScopeToken();
@@ -1995,33 +2088,43 @@ async function reviewGeneratedMessage(messageId, type) {
     const message = chat[index];
     if (!message || message.is_user || message.is_system) return;
     const body = String(message.mes ?? '');
-    if (body.trim().length < 20) return;
+    if (body.trim().length < 2) return;
     const database = storedCanonEntities();
-    if (!Object.keys(database).length) return;
     const recent = reviewContextSummary(chat, index);
-    const records = relevantCanonRecords(body, database).slice(0, 6);
-    if (!records.length) return;
+    const records = config.reviewEnabled ? relevantCanonRecords(body, database).slice(0, 6) : [];
+    if (!trackScene && !records.length) return;
     const signature = `${scopeIdentity()}|${index}:${textHash(body)}`;
     if (reviewedMessageSignatures.has(signature)) return;
     reviewedMessageSignatures.add(signature);
     try {
-        updateReport(`正在按本卡原作资料审核刚生成的正文（涉及 ${records.map(record => record.entity).join('、')}）…`);
+        updateReport(records.length
+            ? `正在异步更新当前场景并审核正文（涉及 ${records.map(record => record.entity).join('、')}）…`
+            : '正在异步更新当前人物、地点和时间节点…');
         const overrideContext = await researchContext(chat.slice(0, index + 1));
         if (!scopeTokenIsCurrent(scopeToken)) return;
-        const parsed = await runJsonAnalysisPrompt(buildReviewPrompt(body.slice(0, 12000), records, recent, overrideContext), 2400);
+        const parsed = await runJsonAnalysisPrompt(buildReviewPrompt(body.slice(0, 12000), records, recent, overrideContext, config.reviewEnabled), 2800);
         if (!scopeTokenIsCurrent(scopeToken)) return;
-        const revisions = Array.isArray(parsed?.revisions) ? parsed.revisions : [];
-        if (parsed?.verdict !== 'conflict' || !revisions.length) {
-            updateReport('正文审核完成：与本卡原作资料没有需要修订的未解释冲突');
+        if (chat[index] !== message || textHash(String(message.mes ?? '')) !== textHash(body)) {
+            updateReport('正文在分析期间被修改或删除，已放弃本轮状态更新与自动修订');
             return;
         }
-        if (chat[index] !== message || textHash(String(message.mes ?? '')) !== textHash(body)) {
-            updateReport('正文在审核期间被修改或删除，已放弃自动修订');
+        const hasLaterConversation = chat.slice(index + 1).some(item => item?.mes && !item.is_system);
+        const sceneResult = trackScene && !hasLaterConversation
+            ? syncDynamicSceneState(parsed?.scene, scopeToken)
+            : null;
+        const sceneStatus = hasLaterConversation
+            ? '当前场景已由后续消息接管，本轮旧快照未写入'
+            : sceneResult
+                ? `当前场景${sceneResult.changed ? '已更新' : '无变化'}`
+                : '当前场景跟踪未启用';
+        const revisions = Array.isArray(parsed?.revisions) ? parsed.revisions : [];
+        if (parsed?.verdict !== 'conflict' || !revisions.length) {
+            updateReport(`${sceneStatus}；正文没有需要修订的未解释原作冲突`, sceneResult?.plan);
             return;
         }
         const { updated, applied } = applyTextRevisions(message.mes, revisions);
         if (!applied.length) {
-            updateReport(`审核发现 ${revisions.length} 处疑似冲突，但无法在正文中逐字定位，未自动修订`);
+            updateReport(`${sceneStatus}；审核发现 ${revisions.length} 处疑似冲突，但无法在正文中逐字定位，未自动修订`, sceneResult?.plan);
             return;
         }
         if (!scopeTokenIsCurrent(scopeToken)) return;
@@ -2039,13 +2142,13 @@ async function reviewGeneratedMessage(messageId, type) {
         const reasons = [...new Set(applied
             .map(item => `${item.entity || '角色'}：${item.reason || '与原作资料不符'}`))].join('；');
         toastr.info(`已按原作资料自动修正 ${applied.length} 处冲突`, '晋阳的同人库');
-        updateReport(`已自动修正 ${applied.length} 处与原作资料的冲突（${reasons.slice(0, 300)}）`);
+        updateReport(`${sceneStatus}；已自动修正 ${applied.length} 处原作冲突（${reasons.slice(0, 300)}）`, sceneResult?.plan);
         console.info('[Fandom Canon] Auto-revised canon conflicts.', applied);
     } catch (error) {
         if (!scopeTokenIsCurrent(scopeToken)) return;
         reviewedMessageSignatures.delete(signature);
-        console.warn('[Fandom Canon] Post-generation review failed.', error);
-        updateReport(`正文审核失败（不影响已生成内容）：${error?.message || error}`);
+        console.warn('[Fandom Canon] Post-generation scene update/review failed.', error);
+        updateReport(`生成后场景更新/审核失败（不影响已生成内容）：${error?.message || error}`);
     }
 }
 
@@ -2384,11 +2487,11 @@ function panelHtml() {
             <div class="inline-drawer-content">
                 <details class="fcr-api-box fcr-release-notes">
                     <summary><i class="fa-solid fa-clock-rotate-left"></i> v${EXTENSION_VERSION} 本版更新内容</summary>
-                    ${releaseNotesListHtml()}
+                    ${releaseHistoryHtml()}
                 </details>
                 <button id="fcr-enabled" class="fcr-check-row" type="button" aria-pressed="${config.enabled}"><span class="fcr-check-box" aria-hidden="true"></span><span>启用原作资料核验（生成前不阻塞正文）</span></button>
                 <button id="fcr-planner" class="fcr-check-row" type="button" aria-pressed="${config.autoPlanner}"><span class="fcr-check-box" aria-hidden="true"></span><span>手动核验时识别用户明确点名的检索对象</span></button>
-                <button id="fcr-auto-update-profile" class="fcr-check-row" type="button" aria-pressed="${config.autoUpdateProfile}"><span class="fcr-check-box" aria-hidden="true"></span><span>核验时更新作品、时间线和当前人物表</span></button>
+                <button id="fcr-auto-update-profile" class="fcr-check-row" type="button" aria-pressed="${config.autoUpdateProfile}"><span class="fcr-check-box" aria-hidden="true"></span><span>生成后随剧情更新当前人物、地点和时间节点</span></button>
                 <button id="fcr-strict" class="fcr-check-row" type="button" aria-pressed="${config.strictMode}"><span class="fcr-check-box" aria-hidden="true"></span><span>严格模式：没有资料依据时不编造精确设定</span></button>
                 <button id="fcr-review" class="fcr-check-row" type="button" aria-pressed="${config.reviewEnabled}"><span class="fcr-check-box" aria-hidden="true"></span><span>生成后自动审核正文，按本卡资料修订未解释的冲突（性格/经历/外貌/能力等）</span></button>
                 <div class="fcr-grid">
