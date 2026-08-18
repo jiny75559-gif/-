@@ -139,6 +139,35 @@
     font-weight: 700;
 }
 
+.fcr-release-notes ul,
+.fcr-release-popup ul {
+    margin: 8px 0 2px;
+    padding-left: 1.4em;
+}
+
+.fcr-release-notes li,
+.fcr-release-popup li {
+    margin: 5px 0;
+    line-height: 1.45;
+}
+
+.fcr-release-popup {
+    box-sizing: border-box;
+    width: min(560px, 100%);
+    text-align: left;
+}
+
+.fcr-release-popup h3 {
+    margin: 0 0 10px;
+    letter-spacing: 0;
+}
+
+.fcr-release-popup p {
+    margin: 10px 0 0;
+    opacity: 0.75;
+    line-height: 1.45;
+}
+
 .fcr-api-actions,
 .fcr-actions {
     align-items: center;
