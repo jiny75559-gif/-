@@ -22,9 +22,15 @@ const MENU_ENTRY_ID = 'fandom-canon-menu-entry';
 const LOCAL_CREDENTIAL_PREFIX = 'sillytavern-fandom-canon-retriever';
 const WORLD_ENTRY_PREFIX = '【同人原作资料库·插件自动维护】';
 const WORLD_ENTRY_MARKER = '·同人原作资料库·';
-const EXTENSION_VERSION = '2.3.8';
+const EXTENSION_VERSION = '2.3.9';
 // Keep this history and CHANGELOG.md in sync for every release.
 const RELEASE_HISTORY = [{
+    version: '2.3.9',
+    notes: [
+        '“AI识别并填写”改用同一套当前场景快照逻辑，替换旧自动项时会保留用户手动固定项。',
+        '手动“立即检索”现在只核验和补充资料，不再把被提及但未在场的人物加入当前人物表。',
+    ],
+}, {
     version: '2.3.8',
     notes: [
         '当前人物/地点改为场景快照：自动项会随角色进场、离场和地点切换增减，不再永久累加。',
@@ -964,8 +970,10 @@ function syncProfileFromPlan(plan) {
         cardProfile.timeline = plan.timeline;
         cardProfile.lastAutoTimeline = plan.timeline;
     }
-    cardProfile.entities = nextEntities.join('，');
-    cardProfile.lastAutoEntities = nextAutoEntities;
+    if (plan.updateEntities !== false) {
+        cardProfile.entities = nextEntities.join('，');
+        cardProfile.lastAutoEntities = nextAutoEntities;
+    }
     const after = JSON.stringify({
         workTitle: cardProfile.workTitle,
         timeline: cardProfile.timeline,
@@ -2261,7 +2269,7 @@ async function autoFillCurrentProfile() {
     updateReport('AI 正在识别角色卡与剧情…');
     try {
         const identifyStartedAt = performance.now();
-        const firstPrompt = `你是同人资料识别助手。必须阅读角色卡正文、世界书和最近剧情，判断是否涉及已有作品，以及剧情属于原作时间线、AU，还是仅借用了同人角色的用户原创世界。角色卡标题只是文件名，不得把标题本身当人物、作品或搜索实体。\n\n只输出 JSON：{"workTitle":"正文能明确确认的作品正式名称；多作品时写多作品交叉同人（当前涉及：作品名）","storyType":"canon_timeline|au_timeline|original_world_with_fandom_characters|original_only|unknown","timeline":"原作/AU节点；若仅含同人角色但剧情是原创世界，则写用户原创世界（仅含同人角色，非原作剧情）；完全无法判断则空字符串","entities":["本轮刚出现、正在场或上下文明确即将登场且需要核实原作资料的具体人物/地点/组织"],"queries":["带人物各自作品名和具体专有名词的全网检索词"]}。不确定的字段留空，不得编造；不要输出“兄妹”“OC”“角色卡”等泛称；用户原创人物不要作为外部检索实体；世界书中的全部候选角色不等于本轮都要搜索，只选择最近剧情相关对象；queries 最多 ${settings().maxQueries} 条，没有具体核实对象就返回空数组。\n\n角色卡正文：\n${source.card || '未读取到'}\n\n当前触发及角色卡内置世界书：\n${source.worldInfo || '无'}\n\n最近剧情：\n${source.recent || '暂无聊天内容。'}`;
+        const firstPrompt = `你是同人资料识别助手。必须阅读角色卡正文、世界书和最近剧情，判断是否涉及已有作品，以及剧情属于原作时间线、AU，还是仅借用了同人角色的用户原创世界。角色卡标题只是文件名，不得把标题本身当人物、作品或搜索实体。\n\n只输出 JSON：{"workTitle":"正文能明确确认的作品正式名称；多作品时写多作品交叉同人（当前涉及：作品名）","storyType":"canon_timeline|au_timeline|original_world_with_fandom_characters|original_only|unknown","timeline":"正文结束时已经明确成立的原作/AU时间节点；完全无法判断则空字符串","entities":["正文结束瞬间仍在场或正直接参与互动的具体有名人物，以及当前一个具体地点"],"queries":["带人物各自作品名和具体专有名词的全网检索词"]}。entities 是完整当前场景快照：必须排除已经离场、上一场景、只被谈及、回忆中、未来可能登场的人物，以及组织、物品、能力、书籍和泛称；角色卡和世界书里的候选人物不能算在场。用户原创人物可以进入当前快照，但不要为其生成外部检索词。不确定的字段留空，不得编造；queries 最多 ${settings().maxQueries} 条，没有具体核实对象就返回空数组。\n\n角色卡正文：\n${source.card || '未读取到'}\n\n当前触发及角色卡内置世界书：\n${source.worldInfo || '无'}\n\n最近剧情：\n${source.recent || '暂无聊天内容。'}`;
         const first = await runJsonAnalysisPrompt(firstPrompt, 2000);
         if (!scopeTokenIsCurrent(scopeToken)) return;
         const identifySeconds = secondsSince(identifyStartedAt);
@@ -2279,23 +2287,25 @@ async function autoFillCurrentProfile() {
         let queries = missingEntities.map(entity =>
             `${entity} ${workTitle} 原作完整角色档案：身份、年龄、外貌身材、典型穿着、性格行为逻辑、能力、重要经历、人际关系、说话风格`.trim());
         queries = cleanPlannedQueries(queries, workTitle).slice(0, settings().maxQueries);
-        const provisional = { work: workTitle, timeline, entities, queries };
+        const provisional = {
+            work: workTitle,
+            timeline,
+            entities,
+            autoEntities: entities,
+            replaceAutoEntities: true,
+            queries,
+        };
         // The first structured pass has already read the card, active lore and
         // recent chat. Fill the visible table now; web research enriches the
         // persistent database in the background and must not hold the UI open.
         const detectedEntities = entities;
-        const nextWorkTitle = workTitle;
-        const nextTimeline = timeline;
-        const nextEntities = [...new Set(detectedEntities)].slice(0, 40).join('，');
-        if (!nextWorkTitle && !nextTimeline && !nextEntities) {
+        if (!workTitle && !timeline && !detectedEntities.length) {
             throw new Error('分析模型没有识别出任何可填写内容，已取消“成功”提示；请确认当前角色卡已打开。');
         }
-        cardProfile.workTitle = nextWorkTitle;
-        cardProfile.timeline = nextTimeline;
-        cardProfile.entities = nextEntities;
-        cardProfile.lastAutoWorkTitle = nextWorkTitle;
-        cardProfile.lastAutoTimeline = nextTimeline;
-        cardProfile.lastAutoEntities = [...new Set(detectedEntities)].slice(0, 40);
+        syncProfileFromPlan(provisional);
+        const nextWorkTitle = cardProfile.workTitle;
+        const nextTimeline = cardProfile.timeline;
+        const nextEntities = cardProfile.entities;
         const suggestedWiki = normalizeApiUrl(first.customWikiApi || '');
         if (suggestedWiki) cardProfile.customWikiApi = suggestedWiki;
         saveSettingsDebounced();
@@ -2413,7 +2423,7 @@ async function runPreflight(chat, type = 'normal', force = false) {
     try {
         const plan = await planQueries(chat);
         if (!scopeTokenIsCurrent(scopeToken)) return;
-        syncProfileFromPlan(plan);
+        syncProfileFromPlan({ ...plan, updateEntities: false });
         const storedPages = loadCanonResearch(plan);
         const missingEntities = missingCanonEntities(plan);
         const locallyChangedEntities = await persistCanonDeltas(plan);
