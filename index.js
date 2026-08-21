@@ -25,10 +25,17 @@ const WORLD_ENTRY_MARKER = '·同人原作资料库·';
 const SCENE_ENTRY_PREFIX = '【晋阳的同人库·当前场景】';
 const SCENE_ENTRY_MARKER = '<!-- FCR_CURRENT_SCENE_V1 -->';
 const SCENE_ENTRY_END_MARKER = '<!-- /FCR_CURRENT_SCENE_V1 -->';
-const SCENE_SYNC_FORMAT_VERSION = 3;
-const EXTENSION_VERSION = '2.4.0';
+const SCENE_SYNC_FORMAT_VERSION = 4;
+const EXTENSION_VERSION = '2.4.1';
 // Keep this history and CHANGELOG.md in sync for every release.
 const RELEASE_HISTORY = [{
+    version: '2.4.1',
+    notes: [
+        '生成后审核现在会优先对照用户最近明确写出的年份、年初/年底、季节或月份，只修正相互矛盾的时间短语。',
+        '明确的用户时间锚点会同时约束当前场景和世界书，防止正文中的模糊时间反向污染资料库。',
+        '时间核对只做本地文本比对，不增加搜索、分析请求或生成前等待。',
+    ],
+}, {
     version: '2.4.0',
     notes: [
         '修复生成后自动总结偶尔完全不触发的问题：消息接收、渲染完成与生成结束都会进入同一去重队列，并由后台巡检自动补跑遗漏。',
@@ -2130,6 +2137,86 @@ function reviewContextSummary(chat, messageId) {
         .join('\n');
 }
 
+const EXPLICIT_TIME_ANCHOR_SOURCE = '(?:\\d{3,4}|[〇○零一二三四五六七八九]{3,4})年(?:的)?(?:年初|年中|年底|年末|年尾|上半年|下半年|初|中|末|春季?|夏季?|秋季?|冬季?|深冬|冬末|[一二三四五六七八九十\\d]{1,2}月(?:上旬|中旬|下旬)?)?';
+
+function latestUserTextBefore(chat, messageId) {
+    return [...(Array.isArray(chat) ? chat.slice(0, messageId) : [])]
+        .reverse()
+        .find(message => message?.is_user && message?.mes)?.mes || '';
+}
+
+function normalizeExplicitTimeAnchor(value) {
+    return String(value ?? '')
+        .replace(/年的年(?=[初中底末尾])/, '年')
+        .replace(/年年(?=[初中底末尾])/, '年')
+        .replace(/年的(?=春|夏|秋|冬|深冬)/, '年')
+        .trim();
+}
+
+function explicitTimeAnchorFromText(text) {
+    const matches = [...stripMarkup(text).matchAll(new RegExp(EXPLICIT_TIME_ANCHOR_SOURCE, 'g'))];
+    return normalizeExplicitTimeAnchor(matches.at(-1)?.[0] || '');
+}
+
+function timelineWithExplicitAnchor(timeline, explicitTimeAnchor) {
+    const anchor = normalizeExplicitTimeAnchor(explicitTimeAnchor);
+    const value = String(timeline ?? '').trim();
+    if (!anchor) return value;
+    if (!value) return anchor;
+    const anchorYear = anchor.match(/^(?:\d{3,4}|[〇○零一二三四五六七八九]{3,4})年/)?.[0] || '';
+    const hasQualifier = Boolean(anchorYear && anchor.length > anchorYear.length);
+    const match = new RegExp(EXPLICIT_TIME_ANCHOR_SOURCE).exec(value);
+    if (match && match.index <= 24) {
+        if (!hasQualifier) {
+            const matchedYear = match[0].match(/^(?:\d{3,4}|[〇○零一二三四五六七八九]{3,4})年/)?.[0] || '';
+            if (matchedYear === anchorYear) return value;
+            if (matchedYear) {
+                return `${value.slice(0, match.index)}${match[0].replace(matchedYear, anchorYear)}${value.slice(match.index + match[0].length)}`;
+            }
+        }
+        return `${value.slice(0, match.index)}${anchor}${value.slice(match.index + match[0].length)}`;
+    }
+    return `${anchor}，${value}`;
+}
+
+function explicitTimelineRevisions(body, explicitTimeAnchor) {
+    const anchor = normalizeExplicitTimeAnchor(explicitTimeAnchor);
+    if (!anchor) return [];
+    const anchorYear = anchor.match(/^(?:\d{3,4}|[〇○零一二三四五六七八九]{3,4})年/)?.[0];
+    if (!anchorYear || anchor.length === anchorYear.length) return [];
+    const sameYearExpression = new RegExp(`${anchorYear}(?:的)?(?:年初|年中|年底|年末|年尾|上半年|下半年|初|中|末|春季?|夏季?|秋季?|冬季?|深冬|冬末|[一二三四五六七八九十\\d]{1,2}月(?:上旬|中旬|下旬)?)`, 'g');
+    return [...new Set(String(body ?? '').match(sameYearExpression) || [])]
+        .filter(value => normalizeExplicitTimeAnchor(value) !== anchor)
+        .map(original => ({
+            original,
+            revised: anchor,
+            entity: '时间线',
+            reason: `用户已明确指定当前时间为${anchor}`,
+        }));
+}
+
+function textWithExplicitTimeAnchor(text, explicitTimeAnchor) {
+    let updated = String(text ?? '');
+    for (const revision of explicitTimelineRevisions(updated, explicitTimeAnchor)) {
+        updated = updated.replaceAll(revision.original, revision.revised);
+    }
+    return updated;
+}
+
+function sceneWithExplicitTimeAnchor(scene, explicitTimeAnchor) {
+    const anchor = normalizeExplicitTimeAnchor(explicitTimeAnchor);
+    if (!anchor) return scene || {};
+    const currentTimeline = String(scene?.timeline || profile().timeline || '').trim();
+    const timeline = timelineWithExplicitAnchor(currentTimeline, anchor);
+    return {
+        ...(scene || {}),
+        timeline,
+        timelineChanged: scene?.timelineChanged === true
+            || normalizeChangeText(timeline) !== normalizeChangeText(profile().timeline),
+        summary: textWithExplicitTimeAnchor(scene?.summary || '', anchor),
+    };
+}
+
 function buildReviewPrompt(body, records, recent, overrideContext = {}, allowReview = true) {
     const cardProfile = profile();
     const profiles = records.map(record => {
@@ -2383,11 +2470,14 @@ function applyTextRevisions(text, revisions) {
         const revised = String(revision?.revised ?? '').trim();
         if (original.length < 2 || !revised || original === revised) continue;
         const firstIndex = updated.indexOf(original);
-        if (firstIndex < 0 || updated.lastIndexOf(original) !== firstIndex) continue;
+        const isTimelineRevision = String(revision?.entity ?? '').trim() === '时间线';
+        if (firstIndex < 0 || (!isTimelineRevision && updated.lastIndexOf(original) !== firstIndex)) continue;
         if (original.length > 600 || revised.length > 600) continue;
         const maximumLength = Math.max(original.length * 2, original.length + 120);
         if (revised.length > maximumLength) continue;
-        updated = updated.replace(original, () => revised);
+        updated = isTimelineRevision
+            ? updated.replaceAll(original, revised)
+            : updated.replace(original, () => revised);
         applied.push({
             original,
             revised,
@@ -2447,6 +2537,7 @@ async function reviewGeneratedMessage(messageId, type, options = {}) {
         const retryAttempt = Math.max(0, Number(options.retryAttempt) || 0);
         const database = storedCanonEntities();
         const recent = reviewContextSummary(chat, index);
+        const explicitTimeAnchor = explicitTimeAnchorFromText(latestUserTextBefore(chat, index));
         const records = config.reviewEnabled ? relevantCanonRecords(body, database).slice(0, 6) : [];
         if (!trackScene && !records.length) return false;
         setSceneSyncState({ status: retryAttempt ? 'retrying' : 'syncing', signature, messageId: index });
@@ -2463,7 +2554,10 @@ async function reviewGeneratedMessage(messageId, type, options = {}) {
                 return false;
             }
             const hasLaterConversation = chat.slice(index + 1).some(item => item?.mes && !item.is_system);
-            const resolvedScene = mergeSceneWithNarrativeBanner(parsed?.scene, body, recent);
+            const resolvedScene = sceneWithExplicitTimeAnchor(
+                mergeSceneWithNarrativeBanner(parsed?.scene, body, recent),
+                explicitTimeAnchor,
+            );
             const sceneResult = trackScene && !hasLaterConversation
                 ? await syncDynamicSceneState(resolvedScene, scopeToken, { messageId: index, type, body })
                 : null;
@@ -2472,9 +2566,13 @@ async function reviewGeneratedMessage(messageId, type, options = {}) {
                 : sceneResult
                     ? `当前场景${sceneResult.changed || sceneResult.worldBookChanged ? '已同步到世界书' : '无变化'}`
                     : '当前场景跟踪未启用';
-            const revisions = Array.isArray(parsed?.revisions) ? parsed.revisions : [];
+            const timelineRevisions = explicitTimelineRevisions(body, explicitTimeAnchor);
+            const revisions = [
+                ...(Array.isArray(parsed?.revisions) ? parsed.revisions : []),
+                ...timelineRevisions,
+            ];
             let reportText = `${sceneStatus}；正文没有需要修订的未解释原作冲突`;
-            if (parsed?.verdict === 'conflict' && revisions.length) {
+            if ((parsed?.verdict === 'conflict' || timelineRevisions.length) && revisions.length) {
                 const { updated, applied } = applyTextRevisions(message.mes, revisions);
                 if (!applied.length) {
                     reportText = `${sceneStatus}；审核发现 ${revisions.length} 处疑似冲突，但无法在正文中逐字定位，未自动修订`;
