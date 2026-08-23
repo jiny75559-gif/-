@@ -25,10 +25,19 @@ const WORLD_ENTRY_MARKER = '·同人原作资料库·';
 const SCENE_ENTRY_PREFIX = '【晋阳的同人库·当前场景】';
 const SCENE_ENTRY_MARKER = '<!-- FCR_CURRENT_SCENE_V1 -->';
 const SCENE_ENTRY_END_MARKER = '<!-- /FCR_CURRENT_SCENE_V1 -->';
-const SCENE_SYNC_FORMAT_VERSION = 4;
-const EXTENSION_VERSION = '2.4.1';
+const SCENE_SYNC_FORMAT_VERSION = 5;
+const EXTENSION_VERSION = '2.4.2';
 // Keep this history and CHANGELOG.md in sync for every release.
 const RELEASE_HISTORY = [{
+    version: '2.4.2',
+    notes: [
+        '修复自动场景分析丢弃 AU 差异的问题：不再把 canonChanges 硬编码为空数组。',
+        '会增量记录所有有明确依据、且会影响后续写作的原著差异，包括身份、阵营、能力、装备、经历、生死、关系、外貌状态、地点势力、事件结果和时间线等，不限于固定类别。',
+        '已保存的 AU 差异会同步到人物条目与当前场景，并在每次正文生成前直接注入；该步骤只读取本地资料，不增加搜索或分析请求。',
+        '正常生成、立即检索和手动核验统一读取本局 AU 总表，属于物品或世界规则的差异也不会在切换入口后失效。',
+        '只有角色卡、用户明确设定、已启用世界书、反复建立的上下文或正文明确发生的变化才会入库；不会把“暂时没提到”误判为 AU。',
+    ],
+}, {
     version: '2.4.1',
     notes: [
         '生成后审核现在会优先对照用户最近明确写出的年份、年初/年底、季节或月份，只修正相互矛盾的时间短语。',
@@ -348,6 +357,7 @@ function profile() {
     cardProfile.lastAutoWorkTitle ??= cardProfile.workTitle || '';
     cardProfile.lastAutoTimeline ??= cardProfile.timeline || '';
     cardProfile.lastAutoEntities ??= manualEntities(cardProfile.entities || '');
+    cardProfile.auChanges ??= [];
     cardProfile.currentScene ??= null;
     cardProfile.sceneSync ??= {
         status: 'idle',
@@ -392,6 +402,7 @@ function clearConversationProfile(cardProfile, conversationId = currentConversat
     cardProfile.lastAutoWorkTitle = '';
     cardProfile.lastAutoTimeline = '';
     cardProfile.lastAutoEntities = [];
+    cardProfile.auChanges = [];
     cardProfile.canonDatabase = {};
     cardProfile.canonWorldBook = '';
     cardProfile.canonDatabaseFormatVersion = 4;
@@ -415,6 +426,7 @@ function profileHasConversationData(cardProfile = profile()) {
         || String(cardProfile.customWikiApi || '').trim()
         || String(cardProfile.canonWorldBook || '').trim()
         || Object.keys(cardProfile.canonDatabase || {}).length
+        || cleanCanonChanges(cardProfile.auChanges).length
         || cleanDetectedEntities(cardProfile.lastAutoEntities).length
         || Boolean(cardProfile.currentScene)
     );
@@ -890,7 +902,14 @@ function changesAreEquivalent(left, right) {
 
 function cleanCanonChanges(values) {
     return (Array.isArray(values) ? values : [])
-        .map(value => typeof value === 'string' ? value : value?.change)
+        .map(value => {
+            if (typeof value === 'string') return value;
+            const entity = normalizeEntityDisplay(value?.entity);
+            const change = String(value?.change ?? '').trim();
+            if (!change) return '';
+            if (!entity || normalizeChangeText(change).includes(normalizeChangeText(entity))) return change;
+            return `${entity}：${change}`;
+        })
         .map(value => String(value ?? '').trim())
         .filter(Boolean);
 }
@@ -931,8 +950,11 @@ async function planQueries(chat) {
     }
 
     const source = await researchContext(chat);
-    const existingChanges = Object.values(database).flatMap(record => Array.isArray(record?.canonChanges) ? record.canonChanges : []);
-    const plannerPrompt = `你是同人正文的原作事实核验器，不是编剧、导演或剧情规划器。你只能识别用户最新输入中已经逐字点名的原作人物、地点、组织或物品，以便核对这些对象的姓名与设定。严禁预测、建议或选择下一位登场角色，严禁把角色卡、世界书、历史剧情或资料库里出现但用户最新输入没有点名的对象放入 entities。角色卡和世界书仅用于判断作品归属与用户明确 AU，不是候选人物清单。\n\n作品（当前表值）：${work || '未填写，请从背景判断'}\n当前时间线/AU节点（上轮表值）：${cardProfile.timeline || '未填写'}\n已经保存的 AU 差异（不得重复返回或改写复述）：\n${existingChanges.length ? existingChanges.join('\n') : '无'}\n\n用户最新输入（entities 中的 candidateName 必须是这里逐字出现的连续文本）：\n${latestUserText || '无'}\n\n角色卡背景（只能用于作品和 AU 判断）：\n${source.card || '未读取到'}\n\n本轮实际激活世界书（只能用于作品和 AU 判断）：\n${source.worldInfo || '无'}\n\n只输出 JSON，不写解释：{"work":"有明确证据的原作名，否则沿用当前作品","storyType":"canon_timeline|au_timeline|original_world_with_fandom_characters|original_only|unknown","timeline":"仅在用户最新输入明确改变时填写当前剧情线","timelineChanged":false,"entities":[{"candidateName":"必须逐字摘自用户最新输入","isOriginal":false,"workHint":"该对象实际所属作品；不确定留空","contextEvidence":"逐字摘录用户点名该对象的短语"}],"canonChanges":["仅写用户最新输入首次明确声明的新 AU 差异；格式为角色正式名：变化"],"queries":["仅用于用户明确点名的新对象，或用户明确改变时间线后需要补查的官方设定"]}\n规则：没有逐字点名的对象必须省略，代词、暗示、可能登场、即将发生、角色卡预设对象、世界书候选对象和历史中曾出现的对象都不得返回。逐个判断对象是否为用户原创；原创对象 isOriginal=true，不外搜。queries 最多 ${config.maxQueries} 条；不得使用“兄妹”“冒险”“OC”等泛称或角色卡标题。只有用户最新输入明确宣布篇章、原作事件阶段或 AU 关键状态跨越到不同节点时，timelineChanged 才能为 true；普通对话、日常推进、换地点、时间流逝和模型自行推断都必须为 false。你的输出只用于事实核验，绝不能参与剧情走向。`;
+    const existingChanges = [
+        ...cleanCanonChanges(cardProfile.auChanges),
+        ...Object.values(database).flatMap(record => cleanCanonChanges(record?.canonChanges)),
+    ].filter((change, index, array) => !array.slice(0, index).some(saved => changesAreEquivalent(change, saved)));
+    const plannerPrompt = `你是同人正文的原作事实核验器，不是编剧、导演或剧情规划器。你只能识别用户最新输入中已经逐字点名的原作人物、地点、组织或物品，以便核对这些对象的姓名与设定。严禁预测、建议或选择下一位登场角色，严禁把角色卡、世界书、历史剧情或资料库里出现但用户最新输入没有点名的对象放入 entities。角色卡和世界书仅用于判断作品归属与用户明确 AU，不是候选人物清单。\n\n作品（当前表值）：${work || '未填写，请从背景判断'}\n当前时间线/AU节点（上轮表值）：${cardProfile.timeline || '未填写'}\n已经保存的 AU 差异（不得重复返回或改写复述）：\n${existingChanges.length ? existingChanges.join('\n') : '无'}\n\n用户最新输入（entities 中的 candidateName 必须是这里逐字出现的连续文本）：\n${latestUserText || '无'}\n\n角色卡背景（只能用于作品和 AU 判断）：\n${source.card || '未读取到'}\n\n本轮实际激活世界书（只能用于作品和 AU 判断）：\n${source.worldInfo || '无'}\n\n只输出 JSON，不写解释：{"work":"有明确证据的原作名，否则沿用当前作品","storyType":"canon_timeline|au_timeline|original_world_with_fandom_characters|original_only|unknown","timeline":"仅在用户最新输入明确改变时填写当前剧情线","timelineChanged":false,"entities":[{"candidateName":"必须逐字摘自用户最新输入","isOriginal":false,"workHint":"该对象实际所属作品；不确定留空","contextEvidence":"逐字摘录用户点名该对象的短语"}],"canonChanges":["仅写用户最新输入首次明确声明、且会影响后续写作的原著差异；格式为具体实体：变化。范围包括但不限于身份、阵营、能力、装备、关键物品、外貌状态、经历、生死、关系、地点势力、事件结果、人物认知、世界规则和时间线"],"queries":["仅用于用户明确点名的新对象，或用户明确改变时间线后需要补查的官方设定"]}\n规则：没有逐字点名的对象必须省略，代词、暗示、可能登场、即将发生、角色卡预设对象、世界书候选对象和历史中曾出现的对象都不得返回。逐个判断对象是否为用户原创；原创对象 isOriginal=true，不外搜。queries 最多 ${config.maxQueries} 条；不得使用“兄妹”“冒险”“OC”等泛称或角色卡标题。只有用户最新输入明确宣布篇章、原作事件阶段或 AU 关键状态跨越到不同节点时，timelineChanged 才能为 true；普通对话、日常推进、换地点、时间流逝和模型自行推断都必须为 false。你的输出只用于事实核验，绝不能参与剧情走向。`;
 
     try {
         const parsed = await runJsonAnalysisPrompt(plannerPrompt, 1800);
@@ -1694,6 +1716,7 @@ function formatCurrentSceneWorldEntry(snapshot) {
     const characters = cleanDetectedEntities(snapshot?.characters);
     const locations = cleanDetectedEntities(snapshot?.locations);
     const pinned = cleanDetectedEntities(snapshot?.pinned);
+    const auChanges = cleanCanonChanges(snapshot?.auChanges);
     const summary = stripMarkup(snapshot?.summary || '').trim();
     return `${SCENE_ENTRY_MARKER}
 用途：这是当前聊天已经发生的场景状态，不是剧情提纲；续写必须从这里衔接，不得把已离场人物重新视为在场。
@@ -1702,6 +1725,7 @@ function formatCurrentSceneWorldEntry(snapshot) {
 当前人物：${characters.join('、') || '无明确在场人物'}
 当前地点：${locations.join('、') || '未确认'}
 用户手动固定：${pinned.join('、') || '无'}
+本卡AU差异：${auChanges.join('；') || '尚无已确认差异'}
 当前状态：${summary || '仅按上列人物、地点与时间线衔接'}
 ${SCENE_ENTRY_END_MARKER}`;
 }
@@ -1858,6 +1882,10 @@ async function reconcileDeletedWorldBookEntries() {
     const keepEntity = name => !removedAliases.has(canonicalEntityKey(name));
     cardProfile.entities = manualEntities(cardProfile.entities).filter(keepEntity).join('，');
     cardProfile.lastAutoEntities = cleanDetectedEntities(cardProfile.lastAutoEntities).filter(keepEntity);
+    cardProfile.auChanges = cleanCanonChanges(cardProfile.auChanges).filter(change => {
+        const normalized = normalizeChangeText(change);
+        return ![...removedAliases].some(alias => alias && normalized.includes(alias));
+    });
     clearRuntimeState();
     saveSettingsDebounced();
     loadProfileIntoPanel();
@@ -1875,7 +1903,7 @@ function targetRecordsForChange(change, planEntities, database) {
         .filter(Boolean);
     const explicitlyMentioned = planned.filter(name => normalizedChange.includes(normalizeChangeText(name)));
     if (explicitlyMentioned.length) return explicitlyMentioned;
-    return planned.length === 1 ? planned : [];
+    return [];
 }
 
 function novelChangesForRecord(changes, recordName, planEntities, database) {
@@ -1886,8 +1914,14 @@ function novelChangesForRecord(changes, recordName, planEntities, database) {
         .filter((change, index, array) => !array.slice(0, index).some(saved => changesAreEquivalent(change, saved)));
 }
 
-async function persistCanonDeltas(plan) {
+async function persistCanonDeltas(plan, { syncScene = true } = {}) {
     const database = storedCanonEntities();
+    const cardProfile = profile();
+    const existingGlobal = cleanCanonChanges(cardProfile.auChanges);
+    const globalAdditions = cleanCanonChanges(plan.canonChanges)
+        .filter(change => !existingGlobal.some(saved => changesAreEquivalent(change, saved)))
+        .filter((change, index, array) => !array.slice(0, index).some(saved => changesAreEquivalent(change, saved)));
+    if (globalAdditions.length) cardProfile.auChanges = [...existingGlobal, ...globalAdditions];
     const changedEntities = new Set();
     for (const recordName of Object.keys(database)) {
         const record = database[recordName];
@@ -1901,10 +1935,14 @@ async function persistCanonDeltas(plan) {
         record.updatedAt = Date.now();
         changedEntities.add(recordName);
     }
-    if (!changedEntities.size) return [];
+    if (!changedEntities.size && !globalAdditions.length) return [];
     saveSettingsDebounced();
-    await syncCanonDatabaseToWorldBook([...changedEntities]);
-    return [...changedEntities];
+    if (changedEntities.size) await syncCanonDatabaseToWorldBook([...changedEntities]);
+    if (syncScene && globalAdditions.length && cardProfile.currentScene) {
+        cardProfile.currentScene.auChanges = cleanCanonChanges(cardProfile.auChanges);
+        await syncCurrentSceneToWorldBook(cardProfile.currentScene);
+    }
+    return [...changedEntities, ...(globalAdditions.length ? ['本卡AU差异'] : [])];
 }
 
 async function saveCanonResearch(plan, pages) {
@@ -2219,6 +2257,11 @@ function sceneWithExplicitTimeAnchor(scene, explicitTimeAnchor) {
 
 function buildReviewPrompt(body, records, recent, overrideContext = {}, allowReview = true) {
     const cardProfile = profile();
+    const savedChanges = [
+        ...cleanCanonChanges(cardProfile.auChanges),
+        ...Object.values(storedCanonEntities()).flatMap(record => cleanCanonChanges(record?.canonChanges)),
+    ]
+        .filter((change, index, array) => !array.slice(0, index).some(saved => changesAreEquivalent(change, saved)));
     const profiles = records.map(record => {
         const text = String(record.profile || '').trim()
             || (record.sources || []).map(source => source.extract).join('\n').slice(0, 1200);
@@ -2229,7 +2272,7 @@ function buildReviewPrompt(body, records, recent, overrideContext = {}, allowRev
     const reviewRule = allowReview && records.length
         ? '同时核对正文中实际出现、且下方有档案的原作角色是否存在姓名译名、年龄身份、外貌、性格行为、能力、经历、人际关系、人物认知或时间线事实冲突。只允许替换造成 OOC 的最短连续文字片段；不得改变剧情走向、登场角色、事件、行动结果、对白轮次、因果关系或场景顺序。拿不准一律判通过。'
         : '本轮没有启用可执行的 OOC 审核。verdict 必须为 pass，revisions 必须为空数组。';
-    return `你负责在正文生成完毕后提取“当前场景事实快照”，并在允许时做原作事实审核。你不是编剧，绝对不得建议、预测、补写或改变后续剧情。\n\n任务一：根据此前剧情和待处理正文，返回正文结束瞬间的当前状态。currentEntities 只能包含：①此刻仍在当前场景中或正通过电话等方式直接参与当前互动的有名人物；②此刻所在的一个具体地点。kind 只能是 character 或 location。必须移除已经离场、上一场景人物、只被谈及的人物、回忆人物、未来可能登场者、组织、物品、能力、书籍和泛称。角色卡与世界书只用于确认身份，绝不能把其中的候选人物当成当前在场。旧快照是上一轮在场状态：若正文没有换场、跳时或明确写某人离开，应保留其中仍可能在场的人物和地点，即使最新一段没有再次点名；一旦正文明确换场或离场，则按新场景重建并移除旧项。若正文开头存在 <!--NE-BANNER-->地点|时段|编号|状态|人物<!--/NE-BANNER-->，其中地点、时段与人物是本轮已经生成的场景元数据，优先级高于旧快照和代词推测；不得用旧角色替换横幅明确列出的人物。若上下文足以判断完整当前快照，sceneComplete=true；若截断严重、无法可靠判断谁仍在场，则为 false，避免误删。用户在插件里手动固定的项目由程序保留，无需你保留。summary 只压缩正文结束时已经发生、且仍影响下一轮衔接的状态，不得写预测、建议或资料来源。\n\n时间规则：timeline 是正文结束时已经明确成立的简短时间线/时间节点。只有正文明确发生日期、时段、篇章、原作事件阶段或 AU 关键状态切换时，timelineChanged 才为 true；不得因为普通对话、模型推测或为了推动故事而改时间线。没有明确变化时原样返回当前值并设为 false。作品发生明确切换或交叉作品焦点变化时才更新 workTitle。\n\n任务二：${reviewRule}\n\n角色卡设定、用户明确指示、已确认 AU 差异和此前剧情已经建立的事实优先于原作档案，不得修订。档案未写明的细节不算冲突。original 必须逐字复制正文中的最短连续原文。\n\n只输出完整 JSON：{"scene":{"sceneComplete":true,"workTitle":"当前明确作品；不变则沿用当前值","storyType":"canon_timeline|au_timeline|original_world_with_fandom_characters|original_only|unknown","timeline":"当前明确时间线或节点","timelineChanged":false,"summary":"正文结束时已经成立、用于下一轮衔接的简短状态","currentEntities":[{"candidateName":"具体人物或地点名","kind":"character|location","isOriginal":false,"workHint":"所属作品；不确定留空","evidence":"证明其此刻仍在场或为当前地点的正文短语"}]},"verdict":"pass|conflict","revisions":[{"original":"正文最短连续原文","revised":"仅修正事实后的对应短片段","entity":"角色名","reason":"简短 OOC 原因"}]}\n\n当前作品：${cardProfile.workTitle || '未填写'}\n当前时间线/AU节点：${cardProfile.timeline || '未填写'}\n上一轮自动人物/地点快照（无离场或换场证据时作为延续基线）：${cleanDetectedEntities(cardProfile.lastAutoEntities).join('、') || '无'}\n\n角色卡优先设定：\n${String(overrideContext.card || '未读取到').slice(0, 7000)}\n\n当前激活世界书优先设定：\n${String(overrideContext.worldInfo || '无').slice(0, 7000)}\n\n可用于审核的角色档案：\n${profiles || '无'}\n\n此前剧情概要：\n${recent || '无'}\n\n待处理正文：\n${body}`;
+    return `你负责在正文生成完毕后提取“当前场景事实快照”、增量识别已经成立的 AU 差异，并在允许时做原作事实审核。你不是编剧，绝对不得建议、预测、补写或改变后续剧情。\n\n任务一：根据此前剧情和待处理正文，返回正文结束瞬间的当前状态。currentEntities 只能包含：①此刻仍在当前场景中或正通过电话等方式直接参与当前互动的有名人物；②此刻所在的一个具体地点。kind 只能是 character 或 location。必须移除已经离场、上一场景人物、只被谈及的人物、回忆人物、未来可能登场者、组织、物品、能力、书籍和泛称。角色卡与世界书只用于确认身份，绝不能把其中的候选人物当成当前在场。旧快照是上一轮在场状态：若正文没有换场、跳时或明确写某人离开，应保留其中仍可能在场的人物和地点，即使最新一段没有再次点名；一旦正文明确换场或离场，则按新场景重建并移除旧项。若正文开头存在 <!--NE-BANNER-->地点|时段|编号|状态|人物<!--/NE-BANNER-->，其中地点、时段与人物是本轮已经生成的场景元数据，优先级高于旧快照和代词推测；不得用旧角色替换横幅明确列出的人物。若上下文足以判断完整当前快照，sceneComplete=true；若截断严重、无法可靠判断谁仍在场，则为 false，避免误删。用户在插件里手动固定的项目由程序保留，无需你保留。summary 只压缩正文结束时已经发生、且仍影响下一轮衔接的状态，不得写预测、建议或资料来源。\n\n时间规则：timeline 是正文结束时已经明确成立的简短时间线/时间节点。只有正文明确发生日期、时段、篇章、原作事件阶段或 AU 关键状态切换时，timelineChanged 才为 true；不得因为普通对话、模型推测或为了推动故事而改时间线。没有明确变化时原样返回当前值并设为 false。作品发生明确切换或交叉作品焦点变化时才更新 workTitle。\n\n任务二：提取本轮新确认、会影响后续写作的原著差异到 canonChanges。差异范围包括但不限于：姓名/身份/年龄、阵营与立场、能力与限制、装备或关键物品的有无/归属/状态、外貌与身体状态、重要经历与记忆、生死与去向、人际关系是否形成/结束/改变、地点与势力状态、关键事件结果、人物认知、作品规则及时间线。每项必须写清具体实体和与原著不同的事实。只有下列依据可入库：角色卡明确设定、用户明确陈述、当前启用世界书明确设定、此前剧情反复且一致地建立的事实，或待处理正文明确描写该变化已经发生。绝不能因为某事暂时没被提到就推断它不存在，也不能把一次疑似写错的助手内容擅自登记为 AU。已有差异不要重复；本轮无新差异则返回空数组。\n\n任务三：${reviewRule}\n\n角色卡设定、用户明确指示、已确认 AU 差异和此前剧情已经建立的事实优先于原作档案，不得修订。档案未写明的细节不算冲突。original 必须逐字复制正文中的最短连续原文。\n\n只输出完整 JSON：{"scene":{"sceneComplete":true,"workTitle":"当前明确作品；不变则沿用当前值","storyType":"canon_timeline|au_timeline|original_world_with_fandom_characters|original_only|unknown","timeline":"当前明确时间线或节点","timelineChanged":false,"summary":"正文结束时已经成立、用于下一轮衔接的简短状态","canonChanges":[{"entity":"发生差异的具体人物/组织/地点/物品或世界规则","change":"与原著不同且已经明确成立的事实","evidence":"角色卡、用户、启用世界书、此前剧情或本轮正文中的简短依据"}],"currentEntities":[{"candidateName":"具体人物或地点名","kind":"character|location","isOriginal":false,"workHint":"所属作品；不确定留空","evidence":"证明其此刻仍在场或为当前地点的正文短语"}]},"verdict":"pass|conflict","revisions":[{"original":"正文最短连续原文","revised":"仅修正事实后的对应短片段","entity":"角色名","reason":"简短 OOC 原因"}]}\n\n当前作品：${cardProfile.workTitle || '未填写'}\n当前时间线/AU节点：${cardProfile.timeline || '未填写'}\n已保存AU差异（不得重复；审核时优先于原著）：${savedChanges.join('；') || '无'}\n上一轮自动人物/地点快照（无离场或换场证据时作为延续基线）：${cleanDetectedEntities(cardProfile.lastAutoEntities).join('、') || '无'}\n\n角色卡优先设定：\n${String(overrideContext.card || '未读取到').slice(0, 7000)}\n\n当前激活世界书优先设定：\n${String(overrideContext.worldInfo || '无').slice(0, 7000)}\n\n可用于审核的角色档案：\n${profiles || '无'}\n\n此前剧情概要：\n${recent || '无'}\n\n待处理正文：\n${body}`;
 }
 
 function parseNarrativeBanner(body) {
@@ -2352,7 +2395,7 @@ function scenePlanFromAnalysis(scene) {
         entities: canonEntities,
         autoEntities: allCurrentEntities,
         entityCandidates: canonCharacters,
-        canonChanges: [],
+        canonChanges: cleanCanonChanges(scene?.canonChanges),
         timelineChanged,
         replaceAutoEntities: scene?.sceneComplete === true,
         researchMode: missingEntities.length ? 'new_entities' : 'none',
@@ -2364,6 +2407,8 @@ function scenePlanFromAnalysis(scene) {
 
 function buildCurrentSceneSnapshot(scene, plan, pinned, messageId, body) {
     const database = storedCanonEntities();
+    const auChanges = [...cleanCanonChanges(profile().auChanges), ...Object.values(database).flatMap(record => cleanCanonChanges(record?.canonChanges)), ...cleanCanonChanges(plan?.canonChanges)]
+        .filter((change, index, array) => !array.slice(0, index).some(saved => changesAreEquivalent(change, saved)));
     const candidates = cleanSceneEntityCandidates(plan.sceneCandidates || scene?.currentEntities)
         .map(candidate => ({
             ...candidate,
@@ -2389,6 +2434,7 @@ function buildCurrentSceneSnapshot(scene, plan, pinned, messageId, body) {
         locations,
         pinned: cleanDetectedEntities(pinned)
             .filter(name => !characters.includes(name) && !locations.includes(name)),
+        auChanges,
         entities: candidates,
         messageId: Number(messageId),
         messageHash: textHash(body),
@@ -2405,6 +2451,7 @@ async function syncDynamicSceneState(scene, scopeToken, reviewTarget = null) {
         .filter(entity => !previousAutoKeys.has(canonicalEntityKey(entity)));
     syncProfileFromPlan(plan);
     const changed = before !== profile().entities;
+    const canonChangedEntities = await persistCanonDeltas(plan, { syncScene: false });
     const snapshot = buildCurrentSceneSnapshot(scene, plan, pinned, reviewTarget?.messageId, reviewTarget?.body || '');
     cardProfile.currentScene = snapshot;
     saveSettingsDebounced();
@@ -2459,7 +2506,7 @@ async function syncDynamicSceneState(scene, scopeToken, reviewTarget = null) {
             }
         });
     }
-    return { plan, changed, worldBookChanged, snapshot, missingEntities, timelineUpdatedEntities };
+    return { plan, changed, worldBookChanged, snapshot, missingEntities, timelineUpdatedEntities, canonChangedEntities };
 }
 
 function applyTextRevisions(text, revisions) {
@@ -2796,7 +2843,7 @@ async function autoFillCurrentProfile() {
     updateReport('AI 正在识别角色卡与剧情…');
     try {
         const identifyStartedAt = performance.now();
-        const firstPrompt = `你是同人资料识别助手。必须阅读角色卡正文、世界书和最近剧情，判断是否涉及已有作品，以及剧情属于原作时间线、AU，还是仅借用了同人角色的用户原创世界。角色卡标题只是文件名，不得把标题本身当人物、作品或搜索实体。\n\n只输出 JSON：{"workTitle":"正文能明确确认的作品正式名称；多作品时写多作品交叉同人（当前涉及：作品名）","storyType":"canon_timeline|au_timeline|original_world_with_fandom_characters|original_only|unknown","timeline":"正文结束时已经明确成立的原作/AU时间节点；完全无法判断则空字符串","entities":["正文结束瞬间仍在场或正直接参与互动的具体有名人物，以及当前一个具体地点"],"queries":["带人物各自作品名和具体专有名词的全网检索词"]}。entities 是完整当前场景快照：必须排除已经离场、上一场景、只被谈及、回忆中、未来可能登场的人物，以及组织、物品、能力、书籍和泛称；角色卡和世界书里的候选人物不能算在场。用户原创人物可以进入当前快照，但不要为其生成外部检索词。不确定的字段留空，不得编造；queries 最多 ${settings().maxQueries} 条，没有具体核实对象就返回空数组。\n\n角色卡正文：\n${source.card || '未读取到'}\n\n当前触发及角色卡内置世界书：\n${source.worldInfo || '无'}\n\n最近剧情：\n${source.recent || '暂无聊天内容。'}`;
+        const firstPrompt = `你是同人资料识别助手。必须阅读角色卡正文、当前实际启用的世界书条目和最近剧情，判断是否涉及已有作品，以及剧情属于原作时间线、AU，还是仅借用了同人角色的用户原创世界。角色卡标题只是文件名，不得把标题本身当人物、作品或搜索实体。\n\n同时提取已经明确成立、会影响后续写作的全部原著差异。范围包括但不限于身份、年龄、阵营、能力、装备或关键物品、外貌与身体状态、经历与记忆、生死去向、人际关系、地点势力、事件结果、人物认知、世界规则和时间线。只能依据角色卡明确设定、用户明确陈述、当前启用世界书明确设定或剧情反复一致建立的事实；不得因为某事没被提到就推断它不存在，也不得把一次疑似助手写错登记为 AU。\n\n只输出 JSON：{"workTitle":"正文能明确确认的作品正式名称；多作品时写多作品交叉同人（当前涉及：作品名）","storyType":"canon_timeline|au_timeline|original_world_with_fandom_characters|original_only|unknown","timeline":"正文结束时已经明确成立的原作/AU时间节点；完全无法判断则空字符串","canonChanges":[{"entity":"发生差异的具体实体或世界规则","change":"与原著不同且已经明确成立的事实","evidence":"简短依据"}],"entities":["正文结束瞬间仍在场或正直接参与互动的具体有名人物，以及当前一个具体地点"],"queries":["带人物各自作品名和具体专有名词的全网检索词"]}。entities 是完整当前场景快照：必须排除已经离场、上一场景、只被谈及、回忆中、未来可能登场的人物，以及组织、物品、能力、书籍和泛称；角色卡和世界书里的候选人物不能算在场。用户原创人物可以进入当前快照，但不要为其生成外部检索词。不确定的字段留空，不得编造；queries 最多 ${settings().maxQueries} 条，没有具体核实对象就返回空数组。\n\n角色卡正文：\n${source.card || '未读取到'}\n\n当前触发及角色卡内置世界书：\n${source.worldInfo || '无'}\n\n最近剧情：\n${source.recent || '暂无聊天内容。'}`;
         const first = await runJsonAnalysisPrompt(firstPrompt, 2000);
         if (!scopeTokenIsCurrent(scopeToken)) return;
         const identifySeconds = secondsSince(identifyStartedAt);
@@ -2806,6 +2853,7 @@ async function autoFillCurrentProfile() {
             ? '用户原创世界（仅含同人角色，非原作剧情）'
             : String(first.timeline || cardProfile.timeline || '').trim();
         const entities = cleanDetectedEntities(first.entities).slice(0, 8);
+        const canonChanges = cleanCanonChanges(first.canonChanges);
         const database = storedCanonEntities();
         const missingEntities = entities.filter(entity => {
             const recordName = findCanonRecordName(entity, database);
@@ -2820,16 +2868,18 @@ async function autoFillCurrentProfile() {
             entities,
             autoEntities: entities,
             replaceAutoEntities: true,
+            canonChanges,
             queries,
         };
         // The first structured pass has already read the card, active lore and
         // recent chat. Fill the visible table now; web research enriches the
         // persistent database in the background and must not hold the UI open.
         const detectedEntities = entities;
-        if (!workTitle && !timeline && !detectedEntities.length) {
+        if (!workTitle && !timeline && !detectedEntities.length && !canonChanges.length) {
             throw new Error('分析模型没有识别出任何可填写内容，已取消“成功”提示；请确认当前角色卡已打开。');
         }
         syncProfileFromPlan(provisional);
+        const changedAuRecords = await persistCanonDeltas(provisional);
         const nextWorkTitle = cardProfile.workTitle;
         const nextTimeline = cardProfile.timeline;
         const nextEntities = cardProfile.entities;
@@ -2837,12 +2887,12 @@ async function autoFillCurrentProfile() {
         if (suggestedWiki) cardProfile.customWikiApi = suggestedWiki;
         saveSettingsDebounced();
         loadProfileIntoPanel();
-        const filled = [nextWorkTitle && '作品名', nextTimeline && '时间线/AU', nextEntities && '人物/地点'].filter(Boolean);
+        const filled = [nextWorkTitle && '作品名', nextTimeline && '时间线/AU', nextEntities && '人物/地点', canonChanges.length && `AU差异${canonChanges.length}条`].filter(Boolean);
         const totalSeconds = secondsSince(startedAt);
         const storedPages = loadCanonResearch(provisional);
         const missingResearchEntities = missingCanonEntities(provisional);
         const needsResearch = queries.length && (missingResearchEntities.length > 0 || storedPages.length === 0);
-        updateReport(`已实际填写：${filled.join('、')}；耗时 ${totalSeconds} 秒（读取 ${contextSeconds} / 识别 ${identifySeconds}）。${needsResearch ? '新资料正在后台检索，不再阻塞页面。' : `已复用本卡资料库 ${storedPages.length} 条资料。`}`, provisional, storedPages);
+        updateReport(`已实际填写：${filled.join('、')}；耗时 ${totalSeconds} 秒（读取 ${contextSeconds} / 识别 ${identifySeconds}）。${changedAuRecords.length ? `已同步 ${canonChanges.length} 条 AU 差异。` : ''}${needsResearch ? '新资料正在后台检索，不再阻塞页面。' : `已复用本卡资料库 ${storedPages.length} 条资料。`}`, provisional, storedPages);
         toastr.success(`已写入：${filled.join('、')}。${needsResearch ? '原作资料会在后台继续补入世界书。' : ''}`, '晋阳的同人库');
         if (needsResearch) {
             const backgroundStartedAt = performance.now();
@@ -2868,8 +2918,10 @@ function buildReference(plan) {
     const records = cleanDetectedEntities(plan.entities)
         .map(entity => database[findCanonRecordName(entity, database)])
         .filter(Boolean);
-    const persistedChanges = records
-        .flatMap(record => Array.isArray(record?.canonChanges) ? record.canonChanges : []);
+    const persistedChanges = [
+        ...cleanCanonChanges(profile().auChanges),
+        ...records.flatMap(record => cleanCanonChanges(record?.canonChanges)),
+    ].filter((change, index, array) => !array.slice(0, index).some(saved => changesAreEquivalent(change, saved)));
     const nameCorrections = records.flatMap(record => recordAliases(record, record.entity)
         .filter(alias => canonicalEntityKey(alias) !== canonicalEntityKey(record.entity))
         .map(alias => `${alias} → ${record.entity}`));
@@ -2915,12 +2967,35 @@ function conversationSignature(chat) {
     ].join('|');
 }
 
+function buildStoredAuReference() {
+    const cardProfile = profile();
+    const database = storedCanonEntities();
+    const changes = [
+        ...cleanCanonChanges(cardProfile.auChanges),
+        ...Object.values(database).flatMap(record => cleanCanonChanges(record?.canonChanges)),
+    ].filter((change, index, array) => !array.slice(0, index).some(saved => changesAreEquivalent(change, saved)));
+    if (!changes.length) return '';
+    return `<fandom_au_overrides>
+以下是本卡已经明确成立的 AU 差异，优先级高于原著资料。只在正文自然涉及对应对象或事实时严格落实，不得把它们当成登场清单、剧情提纲或强制事件，也不得擅自补回原著状态：
+${changes.map(change => `- ${change}`).join('\n')}
+若原著角色档案与这些差异冲突，以这里为准。不要在正文解释本提示、资料库或核验过程。
+</fandom_au_overrides>`;
+}
+
 async function runPreflight(chat, type = 'normal', force = false) {
     setExtensionPrompt(PROMPT_KEY, '', extension_prompt_types.IN_PROMPT, 0, false, extension_prompt_roles.SYSTEM);
     lastReferenceText = '';
     lastRunSignature = '';
     if (!force && type !== 'manual') {
-        updateReport('正文已直接放行；生成前不调用分析 AI、不注入人物或剧情提示，OOC 核验仅在生成后异步执行');
+        await ensureConversationScope();
+        const auReference = settings().enabled ? buildStoredAuReference() : '';
+        if (auReference) {
+            setExtensionPrompt(PROMPT_KEY, auReference, extension_prompt_types.IN_PROMPT, 0, false, extension_prompt_roles.SYSTEM);
+            lastReferenceText = auReference;
+            updateReport('正文已直接放行；已从本地资料注入本卡 AU 差异，不调用分析 AI 或搜索 API');
+        } else {
+            updateReport('正文已直接放行；本卡暂无已确认 AU 差异，生成前不调用分析 AI 或搜索 API');
+        }
         return;
     }
     await ensureConversationScope();
