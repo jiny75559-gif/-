@@ -37,9 +37,16 @@ const SCENE_ENTRY_END_MARKER = '<!-- /FCR_CURRENT_SCENE_V1 -->';
 const SCENE_SYNC_FORMAT_VERSION = 7;
 const CANON_DATABASE_FORMAT_VERSION = 6;
 const CANON_PROFILE_FORMAT_VERSION = 2;
-const EXTENSION_VERSION = '2.5.0';
+const EXTENSION_VERSION = '2.5.1';
 // Keep this history and CHANGELOG.md in sync for every release.
 const RELEASE_HISTORY = [{
+    version: '2.5.1',
+    notes: [
+        '插件自动维护的角色档案与当前场景世界书条目恢复为正常启用，现有资料无需重新搜索即可继续由酒馆原生世界书注入。',
+        '生成前会本地模拟本轮世界书激活结果：已经由酒馆注入且内容为最新版本的条目不再重复写入扩展提示，只补充未激活、尚未落盘或超出世界书预算的相关资料。',
+        '世界书保存异常或插件条目仍处于旧关闭状态时，会自动退回完整本地注入；插件停用后，已经启用的持久世界书仍可按关键词与当前角色卡继续生效。',
+    ],
+}, {
     version: '2.5.0',
     notes: [
         '原著资料链升级为通用实体：人物、地点、物品、能力、组织、事件和世界规则都能分别检索、建档、注入与审核。',
@@ -810,8 +817,27 @@ async function worldInfoContext(chat) {
             .replace(/<!-- FCR_CANON_DATABASE_V2 -->[\s\S]*?<!-- \/FCR_CANON_DATABASE_V2 -->/g, '')
             .replace(/<!-- FCR_CURRENT_SCENE_V1 -->[\s\S]*?<!-- \/FCR_CURRENT_SCENE_V1 -->/g, '');
         const corpus = stripMarkup(combined);
-        const activeEntries = [...(result.allActivatedEntries || [])]
+        const activatedRows = [...(result.allActivatedEntries || [])];
+        const activeEntries = activatedRows
             .map(normalizeWorldInfoEntryState).filter(entry => entry.world && entry.uid && entry.content);
+        // Keep the plugin-owned activation identities separate from the text
+        // corpus above.  Their content must not be re-imported as user World
+        // Info evidence, but normal generation needs to know which durable
+        // entries SillyTavern will already inject so the extension prompt can
+        // supply only the missing subset.
+        const pluginEntries = activatedRows.map(entry => {
+            const entity = parseWorldEntryComment(entry?.comment, profileKey());
+            const scene = isSceneEntryComment(entry?.comment, profileKey());
+            if (!entity && !scene) return null;
+            return {
+                world: String(entry?.world || '').trim(),
+                uid: String(entry?.uid ?? '').trim(),
+                entity,
+                scene,
+                content: String(entry?.content || ''),
+                disabled: entry?.disable === true,
+            };
+        }).filter(Boolean);
         const allEntries = (await getSortedEntries()).map(normalizeWorldInfoEntryState)
             .filter(entry => entry.world && entry.uid && entry.content);
         return {
@@ -820,10 +846,11 @@ async function worldInfoContext(chat) {
             available: true,
             entries: activeEntries,
             entryStates: allEntries,
+            pluginEntries,
         };
     } catch (error) {
         console.warn('[Fandom Canon] Failed to read active World Info.', error);
-        return { text: '', corpus: '', available: false, entries: [], entryStates: [] };
+        return { text: '', corpus: '', available: false, entries: [], entryStates: [], pluginEntries: [] };
     }
 }
 
@@ -2685,13 +2712,13 @@ async function sanitizePersistedProfiles() {
                     const desiredContent = entity
                         ? formatCanonWorldEntry(record)
                         : formatCurrentSceneWorldEntry(cardProfile.currentScene);
-                    // The world book is the durable, user-visible database.  The
-                    // interceptor injects only the currently relevant subset, so
-                    // these entries must stay disabled to avoid duplicate tokens
-                    // and group/solo cross-scope activation by characterFilter.
-                    if (entry.content !== desiredContent || entry.disable !== true) {
+                    // The durable copy is also a native World Info fallback.
+                    // Normal generation performs a dry-run activation check and
+                    // removes current entries from its supplemental prompt, so
+                    // keeping this enabled does not duplicate tokens.
+                    if (entry.content !== desiredContent || entry.disable === true) {
                         entry.content = desiredContent;
-                        entry.disable = true;
+                        entry.disable = false;
                         worldChanged = true;
                     }
                 }
@@ -2750,7 +2777,7 @@ function formatCanonWorldEntry(record) {
     const changes = cleanCanonChanges(record.canonChanges).length
         ? cleanCanonChanges(record.canonChanges).join('；')
         : '无正文明确声明的原著差异；沿用原著设定';
-    return `<!-- FCR_CANON_DATABASE_V2 -->\n实体：${record.entity}\n类型：${entityKindLabel(record.kind)}\n作品：${record.work || '未确认'}\n当前剧情线：${record.timeline || '未确认'}\n已确认AU差异：${changes}\n\n原著基线档案：\n${extracts || (allowBaseline ? '原著资料待核实；仅采用上方已确认AU差异' : '严格模式：原著基线尚未完成可靠性复核；仅采用上方已确认AU差异')}\n<!-- /FCR_CANON_DATABASE_V2 -->`;
+    return `<!-- FCR_CANON_DATABASE_V2 -->\n实体：${record.entity}\n类型：${entityKindLabel(record.kind)}\n作品：${record.work || '未确认'}\n当前剧情线：${record.timeline || '未确认'}\n适用边界：用户最新输入中的明确时间线与AU设定优先；若用户切换到更早或不同节点，不采用本条中尚未发生的事实。\n已确认AU差异：${changes}\n\n原著基线档案：\n${extracts || (allowBaseline ? '原著资料待核实；仅采用上方已确认AU差异' : '严格模式：原著基线尚未完成可靠性复核；仅采用上方已确认AU差异')}\n<!-- /FCR_CANON_DATABASE_V2 -->`;
 }
 
 async function syncCanonDatabaseToWorldBook(entities, scopeToken = captureScopeToken(), freshnessGuard = null) {
@@ -2815,9 +2842,9 @@ async function syncCanonDatabaseToWorldBook(entities, scopeToken = captureScopeT
                 addMemo: true,
                 order: 100,
                 position: 0,
-                // Kept as a visible/persistent database entry.  The normal
-                // preflight injects the relevant subset exactly once.
-                disable: true,
+                // Native World Info is the durable fallback.  The preflight
+                // injects only records that this entry did not activate.
+                disable: false,
                 probability: 100,
                 useProbability: true,
                 excludeRecursion: true,
@@ -2865,7 +2892,7 @@ function formatCurrentSceneWorldEntry(snapshot) {
     const auChanges = cleanCanonChanges(snapshot?.auChanges);
     const summary = stripMarkup(snapshot?.summary || '').trim();
     return `${SCENE_ENTRY_MARKER}
-用途：这是当前聊天已经发生的场景状态，不是剧情提纲；续写必须从这里衔接，不得把已离场人物重新视为在场。
+用途：这是当前聊天已经发生的场景状态，不是剧情提纲；通常从这里衔接，不得把已离场人物重新视为在场。用户最新输入若明确切换时间线、场景或在场状态，以用户最新输入为准并忽略本条冲突部分。
 作品：${snapshot?.workTitle || '未确认'}
 当前时间线：${snapshot?.timeline || '未确认'}
 当前人物：${characters.join('、') || '无明确在场人物'}
@@ -2875,6 +2902,34 @@ function formatCurrentSceneWorldEntry(snapshot) {
 本卡AU差异：${auChanges.join('；') || '尚无已确认差异'}
 当前状态：${summary || '仅按上列人物、地点与时间线衔接'}
 ${SCENE_ENTRY_END_MARKER}`;
+}
+
+function nativeWorldInfoCoverage(worldInfoState, cardProfile = profile()) {
+    const coverage = { available: worldInfoState?.available === true, recordKeys: [], scene: false };
+    // Pending local state means even an activated native entry may be stale.
+    // Keep the complete extension-prompt fallback until the checked save has
+    // committed, rather than deduplicating against content we cannot trust.
+    if (!coverage.available || cardProfile?.worldSyncPending) return coverage;
+    const database = cardProfile?.canonDatabase || {};
+    const recordKeys = new Set();
+    const sameContent = (left, right) => String(left || '').replace(/\r\n/g, '\n').trim()
+        === String(right || '').replace(/\r\n/g, '\n').trim();
+    for (const entry of Array.isArray(worldInfoState?.pluginEntries) ? worldInfoState.pluginEntries : []) {
+        if (!entry || entry.disabled === true) continue;
+        if (entry.scene) {
+            if (cardProfile.currentScene
+                && sameContent(entry.content, formatCurrentSceneWorldEntry(cardProfile.currentScene))) {
+                coverage.scene = true;
+            }
+            continue;
+        }
+        const recordKey = String(entry.entity || '').trim();
+        const record = database[recordKey];
+        if (!record || !sameContent(entry.content, formatCanonWorldEntry(record))) continue;
+        recordKeys.add(recordKey);
+    }
+    coverage.recordKeys = [...recordKeys];
+    return coverage;
 }
 
 async function syncCurrentSceneToWorldBook(snapshot, scopeToken = captureScopeToken(), freshnessGuard = null) {
@@ -2926,10 +2981,10 @@ async function syncCurrentSceneToWorldBook(snapshot, scopeToken = captureScopeTo
             addMemo: true,
             order: 110,
             position: 0,
-            // Current-scene state is injected from local storage together with
-            // canon/AU.  Disabling the durable copy prevents double injection
-            // and prevents a group entry leaking into a member's solo chat.
-            disable: true,
+            // Keep the current-scene fallback native and constant for this card.
+            // characterFilter prevents shared-book leakage, while preflight
+            // activation coverage prevents duplicate local injection.
+            disable: false,
             probability: 100,
             useProbability: true,
             excludeRecursion: true,
@@ -6732,7 +6787,7 @@ function localGenerationRecords(chat) {
     return { selected, latestUser };
 }
 
-function buildStoredGenerationReference(chat) {
+function buildStoredGenerationReference(chat, nativeCoverage = null) {
     const cardProfile = profile();
     const cleanupWarning = cardProfile.cleanupPending
         ? '提示：旧聊天的禁用档案条目正在等待磁盘清理；它们不得作为当前聊天事实。'
@@ -6750,12 +6805,29 @@ function buildStoredGenerationReference(chat) {
     const targetRecords = [...selected, ...sceneRecords].filter((record, index, array) => array.findIndex(other =>
         canonRecordIdentityKey(other) === canonRecordIdentityKey(record)) === index);
     const database = storedCanonEntities();
+    const nativeRecordKeys = new Set(Array.isArray(nativeCoverage?.recordKeys)
+        ? nativeCoverage.recordKeys.map(String) : []);
+    const localSelected = selected.filter(record =>
+        !nativeRecordKeys.has(canonRecordStorageKey(record, database)));
+    const nativeRecordIdentities = targetRecords.filter(record =>
+        nativeRecordKeys.has(canonRecordStorageKey(record, database))).map(record => ({
+        owner: record.entity,
+        kind: record.kind,
+        work: record.work,
+        ownerRecordKey: canonRecordStorageKey(record, database),
+    }));
+    const nativeSceneChanges = nativeCoverage?.scene === true
+        ? cleanCanonChanges(cardProfile.currentScene?.auChanges) : [];
     const projectedFacts = relevantAuFactsForNames([
         ...selectedNames,
         ...currentSceneRecordNames(cardProfile),
     ], latestUser, {
         recordKeys: targetRecords.map(record => canonRecordStorageKey(record, database)).filter(Boolean),
         works: targetRecords.map(record => record.work).filter(Boolean),
+    }).filter(fact => {
+        if (nativeRecordIdentities.some(record => sameAuOwnerIdentity(fact, record))) return false;
+        const text = auFactText(fact);
+        return !nativeSceneChanges.some(change => changesAreEquivalent(change, text));
     });
     // Persistent AU storage is intentionally unlimited.  Only the per-turn
     // relevant projection is bounded so a long-running card cannot make every
@@ -6775,17 +6847,18 @@ function buildStoredGenerationReference(chat) {
         factProjectionBudget -= text.length;
     }
     const scene = cardProfile.currentScene;
-    const sceneText = scene && !movedBackward && !explicitTimelineDirective ? [
+    const sceneText = scene && nativeCoverage?.scene !== true
+        && !movedBackward && !explicitTimelineDirective ? [
         `当前在场人物：${cleanDetectedEntities(scene.characters).join('、') || '无明确在场人物'}`,
         `当前地点：${cleanDetectedEntities(scene.locations).join('、') || '未确认'}`,
         `当前相关原作实体：${cleanDetectedEntities(scene.subjects).join('、') || '无'}`,
         `当前状态：${balancedExcerpt(stripMarkup(scene.summary || ''), 1200) || '按最近正文继续'}`,
     ].join('\n') : '';
-    if (!selected.length && !facts.length && !sceneText && !cleanupWarning && !explicitTimelineDirective) return '';
+    if (!localSelected.length && !facts.length && !sceneText && !cleanupWarning && !explicitTimelineDirective) return '';
     const sections = [];
     const emittedRecords = [];
     let used = 0;
-    for (const record of selected) {
+    for (const record of localSelected) {
         if (explicitTimeAnchor && timelineMovesBackward(record.timeline || cardProfile.timeline, explicitTimeAnchor)) continue;
         const raw = canonBaselineText(record);
         if (!raw) continue;
@@ -6879,27 +6952,45 @@ async function runPreflight(chat, type = 'normal', force = false, _abortGenerati
         const reconciledProfile = profile();
         invalidateProfileTransactions(reconciledProfile);
         const reconciled = reconcileLocalMessageState(activeChat);
-        if (reconciled.changed) {
-            const repairScope = captureScopeToken();
-            const repairRevision = markWorldSyncPending(reconciledProfile);
-            repairWorldBookFromLocalState(
-                reconciledProfile, repairScope, null, repairRevision,
-            ).catch(error => {
+        try {
+            if (reconciled.changed) {
+                const repairScope = captureScopeToken();
+                const repairRevision = markWorldSyncPending(reconciledProfile);
+                const completed = await repairWorldBookFromLocalState(
+                    reconciledProfile, repairScope, null, repairRevision,
+                );
+                if (!completed) scheduleWorldBookRepair(reconciledProfile, repairScope, repairRevision);
+            } else if (reconciledProfile.worldSyncPending) {
+                const repairScope = captureScopeToken();
+                const repairRevision = Number(reconciledProfile.worldSyncRevision) || 0;
+                const completed = await repairWorldBookFromLocalState(
+                    reconciledProfile, repairScope, null, repairRevision,
+                );
+                if (!completed) scheduleWorldBookRepair(reconciledProfile, repairScope, repairRevision);
+            }
+        } catch (error) {
+            if (reconciledProfile.worldSyncPending) {
+                const repairScope = captureScopeToken();
+                const repairRevision = Number(reconciledProfile.worldSyncRevision) || 0;
                 scheduleWorldBookRepair(reconciledProfile, repairScope, repairRevision);
-                console.warn('[Fandom Canon] Deferred message-state world-book repair failed.', error);
-            });
-        } else if (reconciledProfile.worldSyncPending) {
-            scheduleWorldBookRepair(
-                reconciledProfile, captureScopeToken(),
-                Number(reconciledProfile.worldSyncRevision) || 0,
-            );
+            }
+            console.warn('[Fandom Canon] Preflight world-book repair failed; using full local fallback.', error);
         }
         if (!invocationFresh()) return;
-        const auReference = settings().enabled ? buildStoredGenerationReference(activeChat) : '';
+        const worldInfoState = settings().enabled ? await worldInfoContext(activeChat) : null;
+        if (!invocationFresh()) return;
+        const nativeCoverage = nativeWorldInfoCoverage(worldInfoState, reconciledProfile);
+        const nativeCount = nativeCoverage.recordKeys.length + (nativeCoverage.scene ? 1 : 0);
+        const auReference = settings().enabled
+            ? buildStoredGenerationReference(activeChat, nativeCoverage) : '';
         if (auReference) {
             setExtensionPrompt(PROMPT_KEY, auReference, extension_prompt_types.IN_PROMPT, 0, false, extension_prompt_roles.SYSTEM);
             lastReferenceText = auReference;
-            updateReport('正文已直接放行；已从本地资料注入当前相关原著基线与有效 AU，不调用分析 AI 或搜索 API');
+            updateReport(nativeCount
+                ? `正文已直接放行；酒馆世界书已原生注入 ${nativeCount} 个最新插件条目，插件仅补充其余当前相关资料，不调用分析 AI 或搜索 API`
+                : '正文已直接放行；世界书本轮未覆盖相关插件条目，已从本地资料完整补充注入，不调用分析 AI 或搜索 API');
+        } else if (nativeCount) {
+            updateReport(`正文已直接放行；当前相关资料已由酒馆世界书原生注入 ${nativeCount} 个最新插件条目，无需重复补充，不调用分析 AI 或搜索 API`);
         } else {
             updateReport('正文已直接放行；暂无当前相关的已核实本地档案，生成前不调用分析 AI 或搜索 API');
         }

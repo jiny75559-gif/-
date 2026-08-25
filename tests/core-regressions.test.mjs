@@ -62,7 +62,8 @@ function loadCore() {
             recordWorkAliases, disambiguateMentionedCanonRecords,
             candidateRecordName, localGenerationRecords, recordsForReview,
             mergeSceneWithNarrativeBanner, canonProfileMaterial, buildReviewPrompt,
-            modelRevisionIsGrounded, contextAwareExcerpt,
+            modelRevisionIsGrounded, contextAwareExcerpt, nativeWorldInfoCoverage,
+            formatCurrentSceneWorldEntry,
         };
     `;
     globalThis.__fcrTestContext = {
@@ -2279,7 +2280,7 @@ test('world-info AU provenance survives inactivity but rolls back on an explicit
         source.indexOf('\n    const taskBusyOwner = ++busyOwner;', source.indexOf('async function runPreflight(')),
     );
     const reconcileAt = preflight.indexOf('await reconcileWorldInfoAuLifecycle(invocationFresh)');
-    const referenceAt = preflight.indexOf('buildStoredGenerationReference(activeChat)');
+    const referenceAt = preflight.indexOf('buildStoredGenerationReference(activeChat');
     assert.ok(reconcileAt >= 0 && referenceAt > reconcileAt,
         'disabled lore provenance must be removed before the next local generation reference is built');
 });
@@ -2360,10 +2361,92 @@ test('current-model manual analysis blocks overlapping main generation and stopp
     assert.match(review, /scheduleMessageReview\(index, type, \{\s*\.\.\.options,/);
 });
 
+test('native enabled plugin entries suppress only byte-current local duplicates', () => {
+    const core = loadCore();
+    const cardProfile = freshProfile(core);
+    cardProfile.workTitle = '漫威电影宇宙';
+    cardProfile.timeline = '纽约大战后';
+    cardProfile.entities = '古一';
+    cardProfile.canonDatabase['古一'] = {
+        entity: '古一', kind: 'character', work: '漫威电影宇宙', aliases: ['至尊法师'],
+        profile: '古一：光头女性，沉着克制，是卡玛泰姬的至尊法师。',
+        profileFormatVersion: 2, baselineStatus: 'verified', sourceTrust: 'verified',
+        sources: [{ title: 'Ancient One', extract: '古一是卡玛泰姬的至尊法师。' }],
+        canonChanges: [],
+    };
+    const activeFact = {
+        id: 'au-ancient-one-life', owner: '古一', ownerRecordKey: '古一',
+        kind: 'character', work: '漫威电影宇宙', facet: 'status.life',
+        canon: '原著节点后死亡', current: '本世界仍然活着', source: 'user',
+        evidence: '本世界古一仍然活着', active: true,
+    };
+    const activeChange = core.auFactText(activeFact);
+    cardProfile.auFacts = [activeFact];
+    cardProfile.auChanges = [activeChange];
+    cardProfile.canonDatabase['古一'].canonChanges = [activeChange];
+    cardProfile.currentScene = {
+        workTitle: '漫威电影宇宙', timeline: '纽约大战后',
+        characters: ['古一'], locations: ['卡玛泰姬'], subjects: [], pinned: [],
+        auChanges: [activeChange], summary: '古一正在卡玛泰姬与用户交谈。',
+    };
+    cardProfile.worldSyncPending = false;
+    const canonContent = core.formatCanonWorldEntry(cardProfile.canonDatabase['古一']);
+    const sceneContent = core.formatCurrentSceneWorldEntry(cardProfile.currentScene);
+    const nativeState = {
+        available: true,
+        pluginEntries: [
+            { entity: '古一', scene: false, content: canonContent, disabled: false },
+            { entity: '', scene: true, content: sceneContent, disabled: false },
+        ],
+    };
+    const coverage = core.nativeWorldInfoCoverage(nativeState, cardProfile);
+    assert.deepEqual(coverage.recordKeys, ['古一']);
+    assert.equal(coverage.scene, true);
+    const chat = [{ is_user: true, mes: '古一继续解释卡玛泰姬的规则。' }];
+    assert.equal(core.buildStoredGenerationReference(chat, coverage), '',
+        'current native entries must not be duplicated in the extension prompt');
+
+    const staleCoverage = core.nativeWorldInfoCoverage({
+        available: true,
+        pluginEntries: [{ entity: '古一', scene: false, content: '旧内容', disabled: false }],
+    }, cardProfile);
+    assert.deepEqual(staleCoverage.recordKeys, []);
+    assert.match(core.buildStoredGenerationReference(chat, staleCoverage), /光头女性/,
+        'stale native content must retain the complete local fallback');
+
+    cardProfile.worldSyncPending = true;
+    const pendingCoverage = core.nativeWorldInfoCoverage(nativeState, cardProfile);
+    assert.deepEqual(pendingCoverage.recordKeys, []);
+    assert.equal(pendingCoverage.scene, false);
+});
+
+test('managed canon and scene worldbook entries are enabled for native fallback', () => {
+    const source = readFileSync(sourcePath, 'utf8');
+    const sanitizer = source.slice(
+        source.indexOf('async function sanitizePersistedProfiles('),
+        source.indexOf('\nfunction formatCanonWorldEntry', source.indexOf('async function sanitizePersistedProfiles(')),
+    );
+    assert.match(sanitizer, /entry\.disable = false/);
+    const canonSync = source.slice(
+        source.indexOf('async function syncCanonDatabaseToWorldBook('),
+        source.indexOf('\nfunction formatCurrentSceneWorldEntry', source.indexOf('async function syncCanonDatabaseToWorldBook(')),
+    );
+    assert.match(canonSync, /disable: false/);
+    const sceneSync = source.slice(
+        source.indexOf('async function syncCurrentSceneToWorldBook('),
+        source.indexOf('\nasync function clearCurrentSceneWorldBookEntries', source.indexOf('async function syncCurrentSceneToWorldBook(')),
+    );
+    assert.match(sceneSync, /disable: false/);
+});
+
 test('manifest interceptor and minimum client version match the runtime API used by the plugin', () => {
     const manifest = JSON.parse(readFileSync(new URL('../manifest.json', import.meta.url), 'utf8'));
     const source = readFileSync(sourcePath, 'utf8');
     assert.equal(manifest.generate_interceptor, 'fandomCanonPreflight');
     assert.match(source, /globalThis\.fandomCanonPreflight\s*=/);
     assert.equal(manifest.minimum_client_version, '1.13.2');
+    const runtimeVersion = source.match(/const EXTENSION_VERSION = '([^']+)'/)?.[1];
+    assert.equal(manifest.version, runtimeVersion);
+    assert.equal(manifest.js, `index.js?v=${runtimeVersion}`);
+    assert.equal(manifest.css, `style.css?v=${runtimeVersion}`);
 });
